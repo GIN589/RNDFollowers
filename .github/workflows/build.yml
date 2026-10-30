@@ -21,8 +21,9 @@ jobs:
             rm -rf reg
             if git clone --depth 1 "$url" reg 2>/dev/null && [ -d reg/ports/commonlibsse-ng ]; then
               baseline=$(git -C reg rev-parse HEAD)
+              vbase=$(git -C "$VCPKG_INSTALLATION_ROOT" rev-parse HEAD)
               pkgs=$(ls reg/ports | sed 's/.*/"&"/' | paste -sd, -)
-              printf '{"registries":[{"kind":"git","repository":"%s","baseline":"%s","packages":[%s]}]}\n' "$url" "$baseline" "$pkgs" > vcpkg-configuration.json
+              printf '{"default-registry":{"kind":"builtin","baseline":"%s"},"registries":[{"kind":"git","repository":"%s","baseline":"%s","packages":[%s]}]}\n' "$vbase" "$url" "$baseline" "$pkgs" > vcpkg-configuration.json
               echo "Using registry $url at $baseline"
               found=1
               break
