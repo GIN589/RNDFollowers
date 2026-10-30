@@ -12,7 +12,7 @@ find_path(SIMPLEINI_INCLUDE_DIRS "SimpleIni.h" REQUIRED)
 # Builds a version-independent SKSE plugin (SE/AE) with NG's helper.
 add_commonlibsse_plugin(${PROJECT_NAME}
     AUTHOR "RNDFollowers"
+    USE_ADDRESS_LIBRARY
     SOURCES src/main.cpp)
-
 target_include_directories(${PROJECT_NAME} PRIVATE ${SIMPLEINI_INCLUDE_DIRS})
 target_link_libraries(${PROJECT_NAME} PRIVATE spdlog::spdlog)
