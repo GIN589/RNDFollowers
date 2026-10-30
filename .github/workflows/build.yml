@@ -1,0 +1,56 @@
+name: Build RNDFollowers
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure vcpkg registry
+        shell: bash
+        run: |
+          set -e
+          found=0
+          for url in https://github.com/libxse/vcpkg-registry https://github.com/Qudix/vcpkg-registry https://github.com/powerof3/vcpkg-registry; do
+            echo "Trying $url"
+            rm -rf reg
+            if git clone --depth 1 "$url" reg 2>/dev/null && [ -d reg/ports/commonlibsse-ng ]; then
+              baseline=$(git -C reg rev-parse HEAD)
+              pkgs=$(ls reg/ports | sed 's/.*/"&"/' | paste -sd, -)
+              printf '{"registries":[{"kind":"git","repository":"%s","baseline":"%s","packages":[%s]}]}\n' "$url" "$baseline" "$pkgs" > vcpkg-configuration.json
+              echo "Using registry $url at $baseline"
+              found=1
+              break
+            fi
+          done
+          if [ "$found" -ne 1 ]; then
+            echo "No registry containing commonlibsse-ng was found"
+            exit 1
+          fi
+          cat vcpkg-configuration.json
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -B build -S . -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
+            -DVCPKG_HOST_TRIPLET=x64-windows-static-md
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release
+
+      - name: Upload plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: RNDFollowers
+          path: |
+            build/**/RNDFollowers.dll
+            build/**/RNDFollowers.pdb
+            Data/SKSE/Plugins/RNDFollowers.ini
