@@ -16,7 +16,7 @@ jobs:
         run: |
           set -e
           found=0
-          for url in https://github.com/libxse/vcpkg-registry https://github.com/Qudix/vcpkg-registry https://github.com/powerof3/vcpkg-registry; do
+          for url in https://gitlab.com/colorglass/vcpkg-colorglass; do
             echo "Trying $url"
             rm -rf reg
             if git clone --depth 1 "$url" reg 2>/dev/null && [ -d reg/ports/commonlibsse-ng ]; then
