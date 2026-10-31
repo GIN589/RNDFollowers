@@ -69,6 +69,12 @@ namespace
 		bool  infectRaw{ true }, infectStale{ true }, infectRiver{ true }, infectHit{ true }, infectNeglect{ true };
 		float diseaseChanceMult{ 1.0f };
 		bool  uiChinese{ true };
+		// --- auto-eat: followers eat / drink from their own inventory
+		bool  autoEat{ true }, autoDrink{ true };
+		int   autoEatStage{ 3 }, autoDrinkStage{ 2 };
+		bool  autoEatRaw{ false }, autoEatSpoiled{ false }, autoEatRiver{ false };
+		float autoEatCooldown{ 0.25f };   // game hours between meals
+		std::string msgAte{ "ate {}" }, msgDrank{ "drank {}" };
 		std::vector<std::string> diseaseSources{ "ActorTypeAnimal", "ActorTypeUndead" };
 		std::string msgHunger[6]{ "", "is peckish", "is hungry", "is very hungry", "is starving", "is famished" };
 		std::string msgThirst[5]{ "", "is a bit thirsty", "is thirsty", "is very thirsty", "is parched" };
@@ -136,6 +142,16 @@ namespace
 		for (int i = 1; i < 5; ++i) M(std::format("Fatigue{}", i).c_str(), cfg.msgFatigue[i]);
 		M("Infected", cfg.msgInfected);
 		M("Recovered", cfg.msgRecovered);
+		M("AutoAte", cfg.msgAte);
+		M("AutoDrank", cfg.msgDrank);
+		cfg.autoEat = B("AutoEat", "Enabled", cfg.autoEat);
+		cfg.autoDrink = B("AutoEat", "Drink", cfg.autoDrink);
+		cfg.autoEatStage = std::clamp((int)ini.GetLongValue("AutoEat", "HungerStage", cfg.autoEatStage), 1, 5);
+		cfg.autoDrinkStage = std::clamp((int)ini.GetLongValue("AutoEat", "ThirstStage", cfg.autoDrinkStage), 1, 4);
+		cfg.autoEatRaw = B("AutoEat", "AllowRaw", cfg.autoEatRaw);
+		cfg.autoEatSpoiled = B("AutoEat", "AllowSpoiled", cfg.autoEatSpoiled);
+		cfg.autoEatRiver = B("AutoEat", "AllowRiverWater", cfg.autoEatRiver);
+		cfg.autoEatCooldown = std::clamp(F("AutoEat", "CooldownHours", cfg.autoEatCooldown), 0.0f, 24.0f);
 	}
 
 	// ------------------------------------------- user settings (edited by the in-game menu)
@@ -174,6 +190,14 @@ namespace
 		cfg.notify = B("Notifications", cfg.notify);
 		cfg.notifyStage = std::clamp((int)ini.GetLongValue("User", "NotifyFromStage", cfg.notifyStage), 1, 5);
 		cfg.uiChinese = B("ChineseUI", cfg.uiChinese);
+		cfg.autoEat = B("AutoEat", cfg.autoEat);
+		cfg.autoDrink = B("AutoDrink", cfg.autoDrink);
+		cfg.autoEatStage = std::clamp((int)ini.GetLongValue("User", "AutoEatStage", cfg.autoEatStage), 1, 5);
+		cfg.autoDrinkStage = std::clamp((int)ini.GetLongValue("User", "AutoDrinkStage", cfg.autoDrinkStage), 1, 4);
+		cfg.autoEatRaw = B("AutoEatRaw", cfg.autoEatRaw);
+		cfg.autoEatSpoiled = B("AutoEatSpoiled", cfg.autoEatSpoiled);
+		cfg.autoEatRiver = B("AutoEatRiverWater", cfg.autoEatRiver);
+		cfg.autoEatCooldown = std::clamp(F("AutoEatCooldownHours", cfg.autoEatCooldown), 0.0f, 24.0f);
 	}
 
 	void SaveUserConfig()
@@ -197,6 +221,14 @@ namespace
 		ini.SetBoolValue("User", "Notifications", cfg.notify);
 		ini.SetLongValue("User", "NotifyFromStage", cfg.notifyStage);
 		ini.SetBoolValue("User", "ChineseUI", cfg.uiChinese);
+		ini.SetBoolValue("User", "AutoEat", cfg.autoEat);
+		ini.SetBoolValue("User", "AutoDrink", cfg.autoDrink);
+		ini.SetLongValue("User", "AutoEatStage", cfg.autoEatStage);
+		ini.SetLongValue("User", "AutoDrinkStage", cfg.autoDrinkStage);
+		ini.SetBoolValue("User", "AutoEatRaw", cfg.autoEatRaw);
+		ini.SetBoolValue("User", "AutoEatSpoiled", cfg.autoEatSpoiled);
+		ini.SetBoolValue("User", "AutoEatRiverWater", cfg.autoEatRiver);
+		ini.SetDoubleValue("User", "AutoEatCooldownHours", cfg.autoEatCooldown);
 		if (ini.SaveFile(kUserIni) < 0)
 			logger::warn("could not write {}", kUserIni);
 		else
@@ -305,6 +337,7 @@ namespace
 		float timer{ 0 };             // hours since last stage tick
 		int  lastStage[3]{ 0, 0, 0 };
 		bool sleptThisRest{ false };
+		float lastAutoEat{ -1000.0f };   // game hours of the last auto-eat attempt (not saved)
 	};
 
 	std::recursive_mutex mtx;
@@ -447,6 +480,117 @@ namespace
 			r.disease >= 0 ? kDiseaseNames[r.disease] : "none", r.dStage, ab);
 	}
 
+	// ---------------------------------------------------------- food: eating and auto-eat
+	struct FoodInfo
+	{
+		float food{ 0 }, water{ 0 };
+		bool  eats{ false }, drinks{ false }, raw{ false }, stale{ false }, river{ false }, cure{ false };
+		std::string fx;   // effect ids, only filled when asked (log)
+	};
+
+	// What RND would do with this item (uses RND's own effect tables and globals).
+	FoodInfo InspectFood(RE::AlchemyItem* alch, bool listFx)
+	{
+		FoodInfo fi;
+		for (auto* eff : alch->effects) {
+			if (!eff || !eff->baseEffect) continue;
+			const auto fx = eff->baseEffect->GetFormID();
+			if (listFx) fi.fx += std::format("{:08X} ", fx);
+			if (auto f = R.foodFx.find(fx); f != R.foodFx.end()) { fi.food += Val(f->second); fi.eats = true; }
+			else if (auto w = R.waterFx.find(fx); w != R.waterFx.end()) { fi.water += Val(w->second); fi.drinks = true; }
+			else if (fx == R.rawFx) fi.raw = true;
+			else if (fx == R.staleFx) fi.stale = true;
+			else if (fx == R.riverFx) fi.river = true;
+			else if (R.cureFx.contains(fx)) fi.cure = true;
+		}
+		return fi;
+	}
+
+	// Applies one consumed item to a tracked follower: needs, cure, infection chances.
+	void ApplyConsume(RE::Actor* a, Record& r, RE::AlchemyItem* alch, RE::FormID baseId, const char* how)
+	{
+		const FoodInfo fi = InspectFood(alch, cfg.verbose);
+		const float h0 = r.need[kHunger], t0 = r.need[kThirst];
+		if (fi.eats) r.need[kHunger] = std::clamp(r.need[kHunger] - fi.food - RandInt(-5, 5), 0.0f, Val(R.hLvl[5], 240));
+		if (fi.drinks) r.need[kThirst] = std::clamp(r.need[kThirst] - fi.water - RandInt(-5, 5), 0.0f, Val(R.tLvl[4], 240));
+		if (fi.cure) Cure(a, r);
+		if (fi.raw && cfg.infectRaw && Roll(Val(R.chRaw) * cfg.diseaseChanceMult)) Infect(a, r, "raw food");
+		if (fi.stale && cfg.infectStale && Roll(Val(R.chStale) * cfg.diseaseChanceMult)) Infect(a, r, "stale food");
+		if (fi.river && cfg.infectRiver && Roll(Val(R.chRiver) * cfg.diseaseChanceMult)) Infect(a, r, "river water");
+		if (fi.eats || fi.drinks || fi.cure || fi.raw || fi.stale || fi.river)
+			Dbg("{} {} {} ({:08X}): food {:.0f}, water {:.0f}, cure {}, raw {}, stale {}, river {} | hunger {:.0f} -> {:.0f}, thirst {:.0f} -> {:.0f}",
+				a->GetDisplayFullName(), how, alch->GetName(), baseId, fi.food, fi.water, fi.cure, fi.raw, fi.stale, fi.river, h0, r.need[kHunger], t0,
+				r.need[kThirst]);
+		else
+			Dbg("{} used {} ({:08X}) - no RND food/drink effect recognised; its effects: {}", a->GetDisplayFullName(), alch->GetName(), baseId,
+				fi.fx.empty() ? std::string("(none)") : fi.fx);
+	}
+
+	std::string FormatMsg(const std::string& fmt, const std::string& arg)
+	{
+		try {
+			return std::vformat(fmt, std::make_format_args(arg));
+		} catch (...) {
+			return fmt;
+		}
+	}
+
+	// Takes ONE suitable item out of the follower's inventory and applies it. food=true: for hunger, false: for thirst.
+	// Preference: an item that does not overshoot the need (the biggest such one), otherwise the smallest one.
+	bool EatOne(RE::Actor* a, Record& r, bool food)
+	{
+		const float need = food ? r.need[kHunger] : r.need[kThirst];
+		auto inv = a->GetInventory([](RE::TESBoundObject& o) { return o.GetFormType() == RE::FormType::AlchemyItem; });
+		RE::AlchemyItem* best = nullptr;
+		float bestScore = 0.0f;
+		for (auto& [obj, entry] : inv) {
+			if (!obj || entry.first <= 0) continue;
+			auto* alch = obj->As<RE::AlchemyItem>();
+			if (!alch || alch->IsPoison()) continue;
+			const FoodInfo fi = InspectFood(alch, false);
+			const float value = food ? fi.food : fi.water;
+			if (value <= 0.0f || fi.cure) continue;
+			if ((fi.raw && !cfg.autoEatRaw) || (fi.stale && !cfg.autoEatSpoiled) || (fi.river && !cfg.autoEatRiver)) continue;
+			const bool mixed = !food && fi.food > 0.0f;   // keep real meals for hunger
+			const bool fits = value <= need + 5.0f;
+			const float score = (mixed ? 10000.0f : 0.0f) + (fits ? -value : 1000.0f + value);
+			if (!best || score < bestScore) {
+				best = alch;
+				bestScore = score;
+			}
+		}
+		if (!best) return false;
+		static_cast<void>(a->RemoveItem(best, 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr));
+		ApplyConsume(a, r, best, best->GetFormID(), food ? "auto-ate" : "auto-drank");
+		const std::string nm = best->GetName();
+		Say(a, FormatMsg(food ? cfg.msgAte : cfg.msgDrank, nm));
+		return true;
+	}
+
+	// Called every tick for each tracked follower: eat/drink from the inventory when a need reaches the chosen stage.
+	void AutoEat(RE::Actor* a, Record& r, bool sleeping, float nowHours)
+	{
+		if (!cfg.autoEat || sleeping || a->IsInCombat() || a->IsDead()) return;
+		if (nowHours < r.lastAutoEat) r.lastAutoEat = -1000.0f;   // game time went backwards (older save loaded)
+		if (nowHours - r.lastAutoEat < cfg.autoEatCooldown) return;
+		const bool wantFood = StageOf(r.need[kHunger], R.hLvl) >= cfg.autoEatStage;
+		const bool wantDrink = cfg.autoDrink && StageOf(r.need[kThirst], R.tLvl) >= cfg.autoDrinkStage;
+		if (!wantFood && !wantDrink) return;
+		r.lastAutoEat = nowHours;   // also throttles the inventory scan when she has nothing to eat
+		for (int i = 0; wantFood && i < 3 && StageOf(r.need[kHunger], R.hLvl) >= cfg.autoEatStage; ++i) {
+			if (!EatOne(a, r, true)) {
+				Dbg("{}: hungry (stage {}) but has no suitable food in her inventory", a->GetDisplayFullName(), StageOf(r.need[kHunger], R.hLvl));
+				break;
+			}
+		}
+		for (int i = 0; wantDrink && i < 3 && StageOf(r.need[kThirst], R.tLvl) >= cfg.autoDrinkStage; ++i) {
+			if (!EatOne(a, r, false)) {
+				Dbg("{}: thirsty (stage {}) but has no suitable drink in her inventory", a->GetDisplayFullName(), StageOf(r.need[kThirst], R.tLvl));
+				break;
+			}
+		}
+	}
+
 	// ---------------------------------------------------- live view + actions for the menu
 	// Tick() (game thread) publishes a snapshot; the menu (render thread) only reads that snapshot.
 	// Menu buttons never touch actors directly: they queue an Action that Tick() runs on the game thread.
@@ -494,7 +638,7 @@ namespace
 	std::vector<FollowerView> views;
 	GlobalView gview;
 
-	enum class ActType { SetNeed, ResetNeeds, Infect, Cure, ReloadConfig };
+	enum class ActType { SetNeed, ResetNeeds, Infect, Cure, ReloadConfig, EatNow };
 	struct Action
 	{
 		ActType type{ ActType::ReloadConfig };
@@ -603,6 +747,10 @@ namespace
 				case ActType::Cure:
 					Cure(a, r);
 					break;
+				case ActType::EatNow:
+					if (!EatOne(a, r, act.arg == 0))
+						Dbg("menu: {} has no suitable {} in her inventory", a->GetDisplayFullName(), act.arg == 0 ? "food" : "drink");
+					break;
 				default:
 					break;
 				}
@@ -619,6 +767,17 @@ namespace
 		auto* player = RE::PlayerCharacter::GetSingleton();
 		auto* cal = RE::Calendar::GetSingleton();
 		auto* lists = RE::ProcessLists::GetSingleton();
+
+		// Remember loading screens: a time jump right after one is a fast travel (or carriage ride)
+		const auto nowReal = std::chrono::steady_clock::now();
+		static auto prevTick = nowReal;
+		static auto lastLoading = std::chrono::steady_clock::time_point{};
+		const auto tickGap = nowReal - prevTick;
+		prevTick = nowReal;
+		if (tickGap > 3s) lastLoading = nowReal;   // ticks were paused: loading screen
+		if (auto* ui = RE::UI::GetSingleton(); ui && ui->IsMenuOpen("Loading Menu")) lastLoading = nowReal;
+		if (player && !player->Is3DLoaded()) lastLoading = nowReal;
+
 		if (!player || !cal || !lists || !player->Is3DLoaded() || !R.ready) return;
 
 		const float now = cal->GetCurrentGameTime() * 24.0f;
@@ -634,9 +793,9 @@ namespace
 		const bool rndOff = cfg.respectRndState && Val(R.state, 1.0f) < 0.5f;
 		if (rndOff) dt = 0.0f;
 
-		// A big jump of game time that is not sleeping/waiting is treated as fast travel
+		// A big jump of game time right after a loading screen (and not sleeping/waiting) is a fast travel
 		static float jumpHours = 0.0f, jumpCounted = 0.0f;
-		const bool fastTravel = dt >= kJumpHours && !playerSleeping && (std::chrono::steady_clock::now() - lastWaitMenu) > 6s;
+		const bool fastTravel = dt >= kJumpHours && !playerSleeping && (nowReal - lastWaitMenu) > 6s && (nowReal - lastLoading) < 20s;
 		const float needDt = dt * ((fastTravel && cfg.fastTravelSlow) ? std::clamp(cfg.fastTravelMult, 0.0f, 1.0f) : 1.0f);
 		if (fastTravel) {
 			jumpHours = dt;
@@ -711,6 +870,8 @@ namespace
 					}
 				}
 			}
+
+			if (!rndOff) AutoEat(a, r, sleeping, now);
 
 			const int st[3]{ StageOf(r.need[kHunger], R.hLvl), StageOf(r.need[kThirst], R.tLvl), StageOf(r.need[kFatigue], R.sLvl) };
 			for (int n = 0; n < 3; ++n) {
@@ -814,35 +975,7 @@ namespace
 			if (auto l = last.find(key); l != last.end() && t - l->second < 500ms) return BSEventNotifyControl::kContinue;
 			last[key] = t;
 
-			auto& r = it->second;
-			float food = 0, water = 0;
-			bool eats = false, drinks = false, raw = false, stale = false, river = false, cure = false;
-			std::string fxList;
-			const float h0 = r.need[kHunger], t0 = r.need[kThirst];
-			for (auto* eff : alch->effects) {
-				if (!eff || !eff->baseEffect) continue;
-				const auto fx = eff->baseEffect->GetFormID();
-				if (cfg.verbose) fxList += std::format("{:08X} ", fx);
-				if (auto f = R.foodFx.find(fx); f != R.foodFx.end()) { food += Val(f->second); eats = true; }
-				else if (auto w = R.waterFx.find(fx); w != R.waterFx.end()) { water += Val(w->second); drinks = true; }
-				else if (fx == R.rawFx) raw = true;
-				else if (fx == R.staleFx) stale = true;
-				else if (fx == R.riverFx) river = true;
-				else if (R.cureFx.contains(fx)) cure = true;
-			}
-			if (eats) r.need[kHunger] = std::clamp(r.need[kHunger] - food - RandInt(-5, 5), 0.0f, Val(R.hLvl[5], 240));
-			if (drinks) r.need[kThirst] = std::clamp(r.need[kThirst] - water - RandInt(-5, 5), 0.0f, Val(R.tLvl[4], 240));
-			if (cure) Cure(a, r);
-			if (raw && cfg.infectRaw && Roll(Val(R.chRaw) * cfg.diseaseChanceMult)) Infect(a, r, "raw food");
-			if (stale && cfg.infectStale && Roll(Val(R.chStale) * cfg.diseaseChanceMult)) Infect(a, r, "stale food");
-			if (river && cfg.infectRiver && Roll(Val(R.chRiver) * cfg.diseaseChanceMult)) Infect(a, r, "river water");
-			if (eats || drinks || cure || raw || stale || river)
-				Dbg("{} consumed {} ({:08X}): food {:.0f}, water {:.0f}, cure {}, raw {}, stale {}, river {} | hunger {:.0f} -> {:.0f}, thirst {:.0f} -> {:.0f}",
-					a->GetDisplayFullName(), alch->GetName(), e->baseObject, food, water, cure, raw, stale, river,
-					h0, r.need[kHunger], t0, r.need[kThirst]);
-			else
-				Dbg("{} used {} ({:08X}) - no RND food/drink effect recognised; its effects: {}", a->GetDisplayFullName(),
-					alch->GetName(), e->baseObject, fxList.empty() ? "(none)" : fxList);
+			ApplyConsume(a, it->second, alch, e->baseObject, "consumed");
 			return BSEventNotifyControl::kContinue;
 		}
 
@@ -1122,8 +1255,8 @@ namespace
 			Gui::SetNextItemWidth(220.0f);
 			if (Gui::SliderFloat("##ft", &cfg.fastTravelMult, 0.0f, 1.0f, "%.2f")) MarkDirty();
 			Gui::EndDisabled();
-			Wrapped(TR("0 = needs do not grow while fast travelling, 1 = same as normal. A fast travel is detected as a large jump of game time that is not sleeping or waiting, so other big time skips (e.g. carriage rides) are treated the same way.",
-				"0 = 快速旅行期间需求完全不增长，1 = 与平时相同。快速旅行是通过“游戏时间一次大幅跳跃，且不是睡觉或等待”来判断的，因此马车等其他大幅跳时也会被同样处理。"));
+			Wrapped(TR("0 = needs do not grow while fast travelling, 1 = same as normal. A fast travel is detected as a large jump of game time right after a loading screen that is not sleeping or waiting, so carriage rides count too. Time acceleration and waiting do not.",
+				"0 = 快速旅行期间需求完全不增长，1 = 与平时相同。快速旅行是通过“载入画面之后游戏时间大幅跳跃，且不是睡觉或等待”来判断的，所以乘坐马车也算；时间加速和等待不算。"));
 
 			Heading(TR("Notifications", "提示消息"));
 			if (Gui::Checkbox(TR("Show notifications (e.g. \"X is hungry\")", "显示提示（例如“某某很饿”）"), &cfg.notify)) MarkDirty();
@@ -1178,6 +1311,46 @@ namespace
 				"百分比为 RND 自己的感染几率（生食 / 变质 / 河水）乘以该倍率。想立刻让追随者患病或治愈，请用 Debug 页面。"));
 		}
 
+		void __stdcall DrawAutoEat()
+		{
+			LangBar();
+			Heading(TR("Auto eat and drink", "自动进食与饮水"));
+			Wrapped(TR("Followers use food and drinks from their own inventory, so no eating-animation mod is needed. One item is removed and RND's own food values are applied. Nothing happens in combat, while resting, or while RND is paused. It can be used together with eating-animation mods.",
+				"追随者会自动食用自己背包里的食物和饮品，不再需要进食动画 mod。每次消耗一个物品，并按 RND 自己的食物数值降低需求。战斗中、休息时、RND 暂停时不会进食。可以与进食动画 mod 同时使用。"));
+			Gui::Spacing();
+			if (Gui::Checkbox(TR("Followers eat food from their own inventory", "追随者自动食用自己背包里的食物"), &cfg.autoEat)) MarkDirty();
+			Gui::BeginDisabled(!cfg.autoEat);
+			if (Gui::Checkbox(TR("Also drink water and drinks", "同时自动饮水和饮品"), &cfg.autoDrink)) MarkDirty();
+
+			Gui::Spacing();
+			Gui::Text("%s", TR("Eat when hunger reaches stage", "饥饿达到该阶段时进食"));
+			Gui::SameLine();
+			Gui::SetNextItemWidth(160.0f);
+			if (Gui::SliderInt("##aes", &cfg.autoEatStage, 1, 5, "%d")) MarkDirty();
+			Gui::SameLine();
+			Txt(StageName(0, cfg.autoEatStage));
+
+			Gui::Text("%s", TR("Drink when thirst reaches stage", "口渴达到该阶段时饮水"));
+			Gui::SameLine();
+			Gui::SetNextItemWidth(160.0f);
+			if (Gui::SliderInt("##ads", &cfg.autoDrinkStage, 1, 4, "%d")) MarkDirty();
+			Gui::SameLine();
+			Txt(StageName(1, cfg.autoDrinkStage));
+
+			Gui::Text("%s", TR("Pause between meals (game hours)", "两次进食的间隔（游戏小时）"));
+			Gui::SameLine();
+			Gui::SetNextItemWidth(160.0f);
+			if (Gui::SliderFloat("##aec", &cfg.autoEatCooldown, 0.0f, 3.0f, "%.2f h")) MarkDirty();
+
+			Heading(TR("Allowed items", "允许食用的物品"));
+			if (Gui::Checkbox(TR("Raw food (can cause disease)", "生食（可能致病）"), &cfg.autoEatRaw)) MarkDirty();
+			if (Gui::Checkbox(TR("Spoiled food (can cause disease)", "变质的食物（可能致病）"), &cfg.autoEatSpoiled)) MarkDirty();
+			if (Gui::Checkbox(TR("River / stream water (can cause disease)", "溪水 / 河水（可能致病）"), &cfg.autoEatRiver)) MarkDirty();
+			Gui::EndDisabled();
+			Wrapped(TR("A follower prefers food that does not overshoot her hunger. Items she does not recognise as RND food or drink are never used. Use the Eat and Drink buttons on the Debug page to test.",
+				"追随者会优先选择不会超出当前需求的食物。不属于 RND 食物或饮品的物品不会被使用。可以用 Debug 页面的“进食”“喝水”按钮测试。"));
+		}
+
 		void __stdcall DrawDebug()
 		{
 			LangBar();
@@ -1225,6 +1398,10 @@ namespace
 				if (Gui::Button(TR("Infect", "感染"))) QueueAction(Action{ ActType::Infect, f.id, diseaseSel - 1, 0.0f });
 				Gui::SameLine();
 				if (Gui::Button(TR("Cure", "治愈"))) QueueAction(Action{ ActType::Cure, f.id, 0, 0.0f });
+				Gui::SameLine();
+				if (Gui::Button(TR("Eat", "进食"))) QueueAction(Action{ ActType::EatNow, f.id, 0, 0.0f });
+				Gui::SameLine();
+				if (Gui::Button(TR("Drink", "喝水"))) QueueAction(Action{ ActType::EatNow, f.id, 1, 0.0f });
 				Gui::Spacing();
 				Gui::PopID();
 			}
@@ -1236,6 +1413,7 @@ namespace
 			SKSEMenuFramework::AddSectionItem("Status", DrawStatus);
 			SKSEMenuFramework::AddSectionItem("Needs and Speed", DrawSettings);
 			SKSEMenuFramework::AddSectionItem("Disease", DrawDisease);
+			SKSEMenuFramework::AddSectionItem("Auto Eat", DrawAutoEat);
 			SKSEMenuFramework::AddSectionItem("Debug", DrawDebug);
 		}
 	}
