@@ -14,5 +14,7 @@ add_commonlibsse_plugin(${PROJECT_NAME}
     AUTHOR "RNDFollowers"
     USE_ADDRESS_LIBRARY
     SOURCES src/main.cpp)
-target_include_directories(${PROJECT_NAME} PRIVATE ${SIMPLEINI_INCLUDE_DIRS})
+
+target_include_directories(${PROJECT_NAME} PRIVATE ${SIMPLEINI_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_precompile_headers(${PROJECT_NAME} PRIVATE src/PCH.h)
 target_link_libraries(${PROJECT_NAME} PRIVATE spdlog::spdlog)
