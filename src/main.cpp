@@ -5,10 +5,9 @@
 // Needs/diseases are stored in the SKSE co-save. The only form the plugin adds to actors
 // are the RNDF_* abilities, so removing them again is clean (see Uninstall in the INI).
 
-#include <RE/Skyrim.h>
-#include <SKSE/SKSE.h>
+#include "PCH.h"
+
 #include <SimpleIni.h>
-#include <spdlog/sinks/basic_file_sink.h>
 
 #include <algorithm>
 #include <chrono>
@@ -345,9 +344,9 @@ namespace
 			auto& r = it->second;
 
 			const bool bedSleep = a->AsActorState()->GetSitSleepState() == RE::SIT_SLEEP_STATE::kIsSleeping;
-			const bool near = a->GetParentCell() == player->GetParentCell() &&
+			const bool isNear = a->GetParentCell() == player->GetParentCell() &&
 			                  player->GetPosition().GetDistance(a->GetPosition()) <= cfg.sleepRadius;
-			const bool sleeping = bedSleep || (playerSleeping && near);
+			const bool sleeping = bedSleep || (playerSleeping && isNear);
 			if (sleeping) r.sleptThisRest = true;
 
 			if (dt > 0.0f) {
