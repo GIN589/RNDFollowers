@@ -20,6 +20,16 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
+#include <atomic>
+#include <cfloat>
+#include <cstdarg>
+#include <filesystem>
+
+// Third-party header (SKSE Menu Framework): compile it without warnings so it cannot break the build
+#pragma warning(push, 0)
+#include "SKSEMenuFramework.h"
+#pragma warning(pop)
 
 using namespace std::literals;
 namespace logger = SKSE::log;
@@ -51,6 +61,14 @@ namespace
 		float hitDiseaseChance{ 4.0f };
 		float stageHours{ 6.0f };
 		bool  diseaseAddsFatigue{ true };
+		// --- editable from the in-game menu (stored in RNDFollowers_User.ini)
+		float rateMult[3]{ 1.0f, 1.0f, 1.0f };   // multiplier on RND hunger / thirst / fatigue rates
+		bool  fastTravelSlow{ false };           // slow needs down during fast travel
+		float fastTravelMult{ 0.5f };            // share of travel time that counts (0..1)
+		bool  diseaseEnabled{ true };            // allow NEW infections
+		bool  infectRaw{ true }, infectStale{ true }, infectRiver{ true }, infectHit{ true }, infectNeglect{ true };
+		float diseaseChanceMult{ 1.0f };
+		bool  uiChinese{ true };
 		std::vector<std::string> diseaseSources{ "ActorTypeAnimal", "ActorTypeUndead" };
 		std::string msgHunger[6]{ "", "is peckish", "is hungry", "is very hungry", "is starving", "is famished" };
 		std::string msgThirst[5]{ "", "is a bit thirsty", "is thirsty", "is very thirsty", "is parched" };
@@ -81,7 +99,7 @@ namespace
 		return out;
 	}
 
-	void LoadConfig()
+	void LoadMainConfig()
 	{
 		CSimpleIniA ini;
 		ini.SetUnicode();
@@ -118,6 +136,77 @@ namespace
 		for (int i = 1; i < 5; ++i) M(std::format("Fatigue{}", i).c_str(), cfg.msgFatigue[i]);
 		M("Infected", cfg.msgInfected);
 		M("Recovered", cfg.msgRecovered);
+	}
+
+	// ------------------------------------------- user settings (edited by the in-game menu)
+	// Menu changes are stored in their own file so the hand-edited RNDFollowers.ini is never rewritten.
+	constexpr const char* kUserIni = "Data/SKSE/Plugins/RNDFollowers_User.ini";
+	std::mutex cfgMtx;
+	std::atomic<bool> cfgDirty{ false };
+	std::atomic<std::int64_t> cfgDirtyAt{ 0 };
+
+	std::int64_t NowTicks() { return std::chrono::steady_clock::now().time_since_epoch().count(); }
+	void MarkDirty()
+	{
+		cfgDirtyAt = NowTicks();
+		cfgDirty = true;
+	}
+
+	void LoadUserConfig()
+	{
+		CSimpleIniA ini;
+		ini.SetUnicode();
+		if (ini.LoadFile(kUserIni) < 0) return;
+		auto F = [&](const char* k, float d) { return static_cast<float>(ini.GetDoubleValue("User", k, d)); };
+		auto B = [&](const char* k, bool d) { return ini.GetBoolValue("User", k, d); };
+		cfg.rateMult[0] = std::clamp(F("RateHunger", cfg.rateMult[0]), 0.0f, 10.0f);
+		cfg.rateMult[1] = std::clamp(F("RateThirst", cfg.rateMult[1]), 0.0f, 10.0f);
+		cfg.rateMult[2] = std::clamp(F("RateFatigue", cfg.rateMult[2]), 0.0f, 10.0f);
+		cfg.fastTravelSlow = B("FastTravelSlow", cfg.fastTravelSlow);
+		cfg.fastTravelMult = std::clamp(F("FastTravelMult", cfg.fastTravelMult), 0.0f, 1.0f);
+		cfg.diseaseEnabled = B("DiseaseEnabled", cfg.diseaseEnabled);
+		cfg.infectRaw = B("InfectRawFood", cfg.infectRaw);
+		cfg.infectStale = B("InfectStaleFood", cfg.infectStale);
+		cfg.infectRiver = B("InfectRiverWater", cfg.infectRiver);
+		cfg.infectHit = B("InfectWounds", cfg.infectHit);
+		cfg.infectNeglect = B("InfectNeglect", cfg.infectNeglect);
+		cfg.diseaseChanceMult = std::clamp(F("DiseaseChanceMult", cfg.diseaseChanceMult), 0.0f, 10.0f);
+		cfg.notify = B("Notifications", cfg.notify);
+		cfg.notifyStage = std::clamp((int)ini.GetLongValue("User", "NotifyFromStage", cfg.notifyStage), 1, 5);
+		cfg.uiChinese = B("ChineseUI", cfg.uiChinese);
+	}
+
+	void SaveUserConfig()
+	{
+		std::lock_guard lk(cfgMtx);
+		cfgDirty = false;
+		CSimpleIniA ini;
+		ini.SetUnicode();
+		ini.SetDoubleValue("User", "RateHunger", cfg.rateMult[0]);
+		ini.SetDoubleValue("User", "RateThirst", cfg.rateMult[1]);
+		ini.SetDoubleValue("User", "RateFatigue", cfg.rateMult[2]);
+		ini.SetBoolValue("User", "FastTravelSlow", cfg.fastTravelSlow);
+		ini.SetDoubleValue("User", "FastTravelMult", cfg.fastTravelMult);
+		ini.SetBoolValue("User", "DiseaseEnabled", cfg.diseaseEnabled);
+		ini.SetBoolValue("User", "InfectRawFood", cfg.infectRaw);
+		ini.SetBoolValue("User", "InfectStaleFood", cfg.infectStale);
+		ini.SetBoolValue("User", "InfectRiverWater", cfg.infectRiver);
+		ini.SetBoolValue("User", "InfectWounds", cfg.infectHit);
+		ini.SetBoolValue("User", "InfectNeglect", cfg.infectNeglect);
+		ini.SetDoubleValue("User", "DiseaseChanceMult", cfg.diseaseChanceMult);
+		ini.SetBoolValue("User", "Notifications", cfg.notify);
+		ini.SetLongValue("User", "NotifyFromStage", cfg.notifyStage);
+		ini.SetBoolValue("User", "ChineseUI", cfg.uiChinese);
+		if (ini.SaveFile(kUserIni) < 0)
+			logger::warn("could not write {}", kUserIni);
+		else
+			Dbg("menu settings saved to {}", kUserIni);
+	}
+
+	void LoadConfig()
+	{
+		LoadMainConfig();
+		LoadUserConfig();
 	}
 
 	// ------------------------------------------------------- RND form lookups
@@ -305,10 +394,11 @@ namespace
 			}
 	}
 
-	void Infect(RE::Actor* a, Record& r, const char* cause)
+	void Infect(RE::Actor* a, Record& r, const char* cause, bool force = false, int which = -1)
 	{
 		if (r.disease >= 0) return;
-		r.disease = RandInt(0, 5);
+		if (!force && !cfg.diseaseEnabled) return;
+		r.disease = (which >= 0 && which <= 5) ? which : RandInt(0, 5);
 		r.dStage = 0;
 		r.counter = 0;
 		r.timer = 0;
@@ -357,22 +447,203 @@ namespace
 			r.disease >= 0 ? kDiseaseNames[r.disease] : "none", r.dStage, ab);
 	}
 
+	// ---------------------------------------------------- live view + actions for the menu
+	// Tick() (game thread) publishes a snapshot; the menu (render thread) only reads that snapshot.
+	// Menu buttons never touch actors directly: they queue an Action that Tick() runs on the game thread.
+	constexpr float kJumpHours = 0.25f;  // one tick that advances at least this much game time = time jump
+
+	struct AbilityView
+	{
+		int group{ 0 };   // 0 hunger, 1 thirst, 2 fatigue, 3 disease
+		int index{ 0 };   // stage (groups 0-2) or disease * 3 + stage (group 3)
+		std::vector<std::string> fx;
+	};
+
+	struct FollowerView
+	{
+		RE::FormID id{ 0 };
+		std::string name;
+		float need[3]{ 0, 0, 0 };
+		float cap[3]{ 0, 0, 0 };
+		float nextAt[3]{ 0, 0, 0 };
+		int   stage[3]{ 0, 0, 0 };
+		int   maxStage[3]{ 5, 4, 4 };
+		int   disease{ -1 };
+		int   dStage{ -1 };
+		int   counter{ 0 };
+		float timer{ 0 };
+		bool  sleeping{ false };
+		bool  combat{ false };
+		std::vector<AbilityView> abilities;
+	};
+
+	struct GlobalView
+	{
+		bool  ready{ false };
+		bool  rndActive{ true };
+		float baseRate[3]{ 0, 0, 0 };
+		float hLv[6]{ 0, 0, 0, 0, 0, 0 };
+		float tLv[5]{ 0, 0, 0, 0, 0 };
+		float sLv[5]{ 0, 0, 0, 0, 0 };
+		float chance[3]{ 0, 0, 0 };   // raw food, stale food, river water (RND globals, percent)
+		float lastJumpHours{ 0 };
+		float lastJumpCounted{ 0 };
+	};
+
+	std::mutex viewMtx;
+	std::vector<FollowerView> views;
+	GlobalView gview;
+
+	enum class ActType { SetNeed, ResetNeeds, Infect, Cure, ReloadConfig };
+	struct Action
+	{
+		ActType type{ ActType::ReloadConfig };
+		RE::FormID id{ 0 };   // 0 = every tracked follower
+		int   arg{ 0 };       // need index (SetNeed) or disease index (Infect, -1 = random)
+		float value{ 0 };
+	};
+	std::mutex actMtx;
+	std::vector<Action> pending;
+	void QueueAction(const Action& a)
+	{
+		std::lock_guard lk(actMtx);
+		pending.push_back(a);
+	}
+
+	std::vector<std::string> FxOf(RE::SpellItem* sp)
+	{
+		static std::unordered_map<RE::FormID, std::vector<std::string>> cache;
+		const auto id = sp->GetFormID();
+		if (auto it = cache.find(id); it != cache.end()) return it->second;
+		std::vector<std::string> out;
+		for (auto* eff : sp->effects) {
+			if (!eff || !eff->baseEffect) continue;
+			std::string n = eff->baseEffect->GetName();
+			if (n.empty()) n = std::format("{:08X}", eff->baseEffect->GetFormID());
+			const float mag = eff->effectItem.magnitude;
+			out.push_back(std::fabs(mag) > 0.001f ? std::format("{} ({:+.0f})", n, mag) : n);
+		}
+		cache[id] = out;
+		return out;
+	}
+
+	// abilities that are really on the actor right now (HasSpell), with the effects each one contains
+	std::vector<AbilityView> CollectAbilities(RE::Actor* a)
+	{
+		std::vector<AbilityView> out;
+		auto add = [&](RE::SpellItem* sp, int group, int index) {
+			if (sp && a->HasSpell(sp)) out.push_back(AbilityView{ group, index, FxOf(sp) });
+		};
+		for (int i = 0; i < 6; ++i) add(R.hunger[i], 0, i);
+		for (int i = 0; i < 5; ++i) add(R.thirst[i], 1, i);
+		for (int i = 0; i < 5; ++i) add(R.sleep[i], 2, i);
+		for (int d = 0; d < 6; ++d)
+			for (int s = 0; s < 3; ++s) add(R.disease[d][s], 3, d * 3 + s);
+		return out;
+	}
+
+	FollowerView BuildView(RE::Actor* a, const Record& r, bool sleeping)
+	{
+		FollowerView v;
+		v.id = a->GetFormID();
+		v.name = a->GetDisplayFullName();
+		for (int n = 0; n < 3; ++n) v.need[n] = r.need[n];
+		v.stage[0] = StageOf(r.need[kHunger], R.hLvl);
+		v.stage[1] = StageOf(r.need[kThirst], R.tLvl);
+		v.stage[2] = StageOf(r.need[kFatigue], R.sLvl);
+		v.cap[0] = Val(R.hLvl[5], 240.0f);
+		v.cap[1] = Val(R.tLvl[4], 240.0f);
+		v.cap[2] = Val(R.sLvl[4], 240.0f);
+		v.nextAt[0] = v.stage[0] < 5 ? Val(R.hLvl[v.stage[0] + 1]) : 0.0f;
+		v.nextAt[1] = v.stage[1] < 4 ? Val(R.tLvl[v.stage[1] + 1]) : 0.0f;
+		v.nextAt[2] = v.stage[2] < 4 ? Val(R.sLvl[v.stage[2] + 1]) : 0.0f;
+		v.disease = r.disease;
+		v.dStage = r.dStage;
+		v.counter = r.counter;
+		v.timer = r.timer;
+		v.sleeping = sleeping;
+		v.combat = a->IsInCombat();
+		v.abilities = CollectAbilities(a);
+		return v;
+	}
+
+	// Runs queued menu actions. Call on the game thread with mtx held.
+	void RunActions()
+	{
+		std::vector<Action> todo;
+		{
+			std::lock_guard lk(actMtx);
+			todo.swap(pending);
+		}
+		const float caps[3]{ Val(R.hLvl[5], 240.0f), Val(R.tLvl[4], 240.0f), Val(R.sLvl[4], 240.0f) };
+		for (auto& act : todo) {
+			if (act.type == ActType::ReloadConfig) {
+				LoadConfig();
+				logger::info("settings reloaded from the menu");
+				continue;
+			}
+			for (auto& [id, r] : state) {
+				if (act.id != 0 && act.id != id) continue;
+				auto* a = RE::TESForm::LookupByID<RE::Actor>(id);
+				if (!a) continue;
+				switch (act.type) {
+				case ActType::SetNeed: {
+					const int n = std::clamp(act.arg, 0, 2);
+					r.need[n] = std::clamp(act.value, 0.0f, caps[n]);
+					Dbg("menu: {} need {} set to {:.0f}", a->GetDisplayFullName(), n, r.need[n]);
+					break;
+				}
+				case ActType::ResetNeeds:
+					for (auto& v : r.need) v = 0.0f;
+					Dbg("menu: {} needs reset", a->GetDisplayFullName());
+					break;
+				case ActType::Infect:
+					Infect(a, r, "menu", true, act.arg);
+					break;
+				case ActType::Cure:
+					Cure(a, r);
+					break;
+				default:
+					break;
+				}
+			}
+		}
+	}
+
 	// -------------------------------------------------------------------- tick
 	void Tick()
 	{
+		// save menu settings ~2 s after the last change
+		if (cfgDirty && NowTicks() - cfgDirtyAt >= 2000000000LL) SaveUserConfig();
+
 		auto* player = RE::PlayerCharacter::GetSingleton();
 		auto* cal = RE::Calendar::GetSingleton();
 		auto* lists = RE::ProcessLists::GetSingleton();
 		if (!player || !cal || !lists || !player->Is3DLoaded() || !R.ready) return;
 
 		const float now = cal->GetCurrentGameTime() * 24.0f;
+		// remember when the Sleep/Wait menu was last open (to tell waiting apart from fast travel)
+		static auto lastWaitMenu = std::chrono::steady_clock::time_point{};
+		if (auto* ui = RE::UI::GetSingleton(); ui && ui->IsMenuOpen("Sleep/Wait Menu")) lastWaitMenu = std::chrono::steady_clock::now();
 		std::lock_guard lk(mtx);
+		RunActions();
 		if (lastHours < 0.0f || now < lastHours) { lastHours = now; return; }
 		float dt = std::min(now - lastHours, 72.0f);
 		lastHours = now;
 
 		const bool rndOff = cfg.respectRndState && Val(R.state, 1.0f) < 0.5f;
 		if (rndOff) dt = 0.0f;
+
+		// A big jump of game time that is not sleeping/waiting is treated as fast travel
+		static float jumpHours = 0.0f, jumpCounted = 0.0f;
+		const bool fastTravel = dt >= kJumpHours && !playerSleeping && (std::chrono::steady_clock::now() - lastWaitMenu) > 6s;
+		const float needDt = dt * ((fastTravel && cfg.fastTravelSlow) ? std::clamp(cfg.fastTravelMult, 0.0f, 1.0f) : 1.0f);
+		if (fastTravel) {
+			jumpHours = dt;
+			jumpCounted = needDt;
+			Dbg("time jump / fast travel detected: {:.2f} h, counted for needs: {:.2f} h", dt, needDt);
+		}
+		std::vector<FollowerView> newViews;
 
 		const float caps[3]{ Val(R.hLvl[5], 240), Val(R.tLvl[4], 240), Val(R.sLvl[4], 240) };
 
@@ -420,14 +691,14 @@ namespace
 			if (sleeping) r.sleptThisRest = true;
 
 			if (dt > 0.0f) {
-				r.need[kHunger] += dt * Val(R.rate[kHunger]) * (sleeping ? cfg.sleepMult[0] : 1.0f);
-				r.need[kThirst] += dt * Val(R.rate[kThirst]) * (sleeping ? cfg.sleepMult[1] : 1.0f);
+				r.need[kHunger] += needDt * Val(R.rate[kHunger]) * cfg.rateMult[0] * (sleeping ? cfg.sleepMult[0] : 1.0f);
+				r.need[kThirst] += needDt * Val(R.rate[kThirst]) * cfg.rateMult[1] * (sleeping ? cfg.sleepMult[1] : 1.0f);
 				if (sleeping) {
 					r.need[kFatigue] -= dt * cfg.restPerHour;
 				} else {
-					r.need[kFatigue] += dt * Val(R.rate[kFatigue]) * (a->IsInCombat() ? cfg.combatFatigueMult : 1.0f);
+					r.need[kFatigue] += needDt * Val(R.rate[kFatigue]) * cfg.rateMult[2] * (a->IsInCombat() ? cfg.combatFatigueMult : 1.0f);
 					if (cfg.diseaseAddsFatigue && r.disease >= 0 && r.dStage >= 0)
-						r.need[kFatigue] += dt * Val(R.disFat[std::clamp(r.dStage, 0, 2)]);
+						r.need[kFatigue] += needDt * Val(R.disFat[std::clamp(r.dStage, 0, 2)]);
 				}
 				for (int n = 0; n < 3; ++n) r.need[n] = std::clamp(r.need[n], 0.0f, caps[n]);
 
@@ -451,14 +722,31 @@ namespace
 			}
 
 			// neglect: severe starvation/dehydration/exhaustion can make followers sick
-			if (dt > 0.0f && r.disease < 0 && (st[0] >= 4 || st[1] >= 4 || st[2] >= 4)) {
+			if (cfg.diseaseEnabled && cfg.infectNeglect && dt > 0.0f && r.disease < 0 && (st[0] >= 4 || st[1] >= 4 || st[2] >= 4)) {
 				const float p = 100.0f * (1.0f - std::pow(1.0f - 0.02f, dt));
-				if (Roll(p)) Infect(a, r, "weakened by neglect");
+				if (Roll(p * cfg.diseaseChanceMult)) Infect(a, r, "weakened by neglect");
 			}
 
 			ApplyAbilities(a, r);
 			if (doSummary) LogSummary(a, r);
+			newViews.push_back(BuildView(a, r, sleeping));
 		}
+
+		// publish the snapshot for the menu
+		GlobalView g;
+		g.ready = true;
+		g.rndActive = !rndOff;
+		for (int n = 0; n < 3; ++n) g.baseRate[n] = Val(R.rate[n]);
+		for (int i = 0; i < 6; ++i) g.hLv[i] = Val(R.hLvl[i]);
+		for (int i = 0; i < 5; ++i) { g.tLv[i] = Val(R.tLvl[i]); g.sLv[i] = Val(R.sLvl[i]); }
+		g.chance[0] = Val(R.chRaw);
+		g.chance[1] = Val(R.chStale);
+		g.chance[2] = Val(R.chRiver);
+		g.lastJumpHours = jumpHours;
+		g.lastJumpCounted = jumpCounted;
+		std::lock_guard vlk(viewMtx);
+		views = std::move(newViews);
+		gview = g;
 	}
 
 	// Called when the player finishes sleeping: followers who rested may shake off a disease (RND rules).
@@ -545,9 +833,9 @@ namespace
 			if (eats) r.need[kHunger] = std::clamp(r.need[kHunger] - food - RandInt(-5, 5), 0.0f, Val(R.hLvl[5], 240));
 			if (drinks) r.need[kThirst] = std::clamp(r.need[kThirst] - water - RandInt(-5, 5), 0.0f, Val(R.tLvl[4], 240));
 			if (cure) Cure(a, r);
-			if (raw && Roll(Val(R.chRaw))) Infect(a, r, "raw food");
-			if (stale && Roll(Val(R.chStale))) Infect(a, r, "stale food");
-			if (river && Roll(Val(R.chRiver))) Infect(a, r, "river water");
+			if (raw && cfg.infectRaw && Roll(Val(R.chRaw) * cfg.diseaseChanceMult)) Infect(a, r, "raw food");
+			if (stale && cfg.infectStale && Roll(Val(R.chStale) * cfg.diseaseChanceMult)) Infect(a, r, "stale food");
+			if (river && cfg.infectRiver && Roll(Val(R.chRiver) * cfg.diseaseChanceMult)) Infect(a, r, "river water");
 			if (eats || drinks || cure || raw || stale || river)
 				Dbg("{} consumed {} ({:08X}): food {:.0f}, water {:.0f}, cure {}, raw {}, stale {}, river {} | hunger {:.0f} -> {:.0f}, thirst {:.0f} -> {:.0f}",
 					a->GetDisplayFullName(), alch->GetName(), e->baseObject, food, water, cure, raw, stale, river,
@@ -568,13 +856,13 @@ namespace
 
 			std::lock_guard lk(mtx);
 			auto it = state.find(victim->GetFormID());
-			if (it == state.end() || it->second.disease >= 0) return BSEventNotifyControl::kContinue;
+			if (it == state.end() || it->second.disease >= 0 || !cfg.diseaseEnabled || !cfg.infectHit) return BSEventNotifyControl::kContinue;
 			bool source = false;
 			for (auto& kw : cfg.diseaseSources) if (RaceHas(attacker, kw)) { source = true; break; }
 			if (!source) return BSEventNotifyControl::kContinue;
 			const float resist = std::clamp(victim->AsActorValueOwner()->GetActorValue(RE::ActorValue::kResistDisease), 0.0f, 100.0f);
 			Dbg("{} was hit by disease source {}, resist {:.0f}", victim->GetDisplayFullName(), attacker->GetDisplayFullName(), resist);
-			if (Roll(cfg.hitDiseaseChance * (1.0f - resist / 100.0f))) Infect(victim, it->second, "wounded");
+			if (Roll(cfg.hitDiseaseChance * cfg.diseaseChanceMult * (1.0f - resist / 100.0f))) Infect(victim, it->second, "wounded");
 			return BSEventNotifyControl::kContinue;
 		}
 
@@ -659,6 +947,299 @@ namespace
 		playerSleeping = false;
 	}
 
+	// ------------------------------------------------------------------ in-game menu
+	// Drawn by SKSE Menu Framework on the render thread. It reads the snapshot (views / gview),
+	// edits plain settings in cfg, and queues Actions that the game thread runs in Tick().
+	namespace Menu
+	{
+		namespace Gui = ImGuiMCP;
+
+		constexpr Gui::ImVec4 kGood{ 0.45f, 0.90f, 0.45f, 1.0f };
+		constexpr Gui::ImVec4 kWarn{ 0.95f, 0.85f, 0.30f, 1.0f };
+		constexpr Gui::ImVec4 kOrange{ 1.00f, 0.60f, 0.25f, 1.0f };
+		constexpr Gui::ImVec4 kBad{ 1.00f, 0.35f, 0.35f, 1.0f };
+		constexpr Gui::ImVec4 kHead{ 0.55f, 0.80f, 1.00f, 1.0f };
+
+		const char* TR(const char* en, const char* zh) { return cfg.uiChinese ? zh : en; }
+		void Txt(const std::string& s) { Gui::Text("%s", s.c_str()); }
+		void Wrapped(const char* s) { Gui::TextWrapped("%s", s); }
+		void Heading(const char* s)
+		{
+			Gui::Spacing();
+			Gui::Separator();
+			Gui::TextColored(kHead, "%s", s);
+			Gui::Spacing();
+		}
+
+		void LangBar()
+		{
+			Gui::Text("%s", "Language / 语言:");
+			Gui::SameLine();
+			if (Gui::Button("EN")) { cfg.uiChinese = false; MarkDirty(); }
+			Gui::SameLine();
+			if (Gui::Button("ZH")) { cfg.uiChinese = true; MarkDirty(); }
+		}
+
+		const char* NeedName(int n)
+		{
+			static const char* en[3]{ "Hunger", "Thirst", "Fatigue" };
+			static const char* zh[3]{ "饥饿", "口渴", "疲劳" };
+			return (cfg.uiChinese ? zh : en)[std::clamp(n, 0, 2)];
+		}
+
+		const char* StageName(int n, int s)
+		{
+			static const char* en[3][6]{ { "Full", "Peckish", "Hungry", "Very hungry", "Starving", "Famished" },
+				{ "Quenched", "A bit thirsty", "Thirsty", "Very thirsty", "Parched", "" },
+				{ "Rested", "A bit tired", "Tired", "Very tired", "Exhausted", "" } };
+			static const char* zh[3][6]{ { "饱腹", "有点饿", "饥饿", "很饿", "快饿昏了", "饿到极限" },
+				{ "不渴", "有点渴", "口渴", "很渴", "极度干渴", "" },
+				{ "精神饱满", "有点累", "疲劳", "很累", "精疲力竭", "" } };
+			return (cfg.uiChinese ? zh : en)[std::clamp(n, 0, 2)][std::clamp(s, 0, 5)];
+		}
+
+		std::string AbilityLabel(const AbilityView& ab)
+		{
+			if (ab.group <= 2) return std::format("{} {}: {}", NeedName(ab.group), ab.index, StageName(ab.group, ab.index));
+			return std::format("{}  ({} {}/3)", kDiseaseNames[std::clamp(ab.index / 3, 0, 5)], TR("stage", "阶段"), ab.index % 3 + 1);
+		}
+
+		Gui::ImVec4 StageColor(int st, int mx)
+		{
+			if (st <= 0) return kGood;
+			const float t = static_cast<float>(st) / static_cast<float>(mx);
+			if (t < 0.35f) return kWarn;
+			if (t < 0.70f) return kOrange;
+			return kBad;
+		}
+
+		void NeedBar(const FollowerView& f, int n)
+		{
+			Gui::Text("%s", NeedName(n));
+			Gui::SameLine(90.0f);
+			const float frac = f.cap[n] > 0.0f ? std::clamp(f.need[n] / f.cap[n], 0.0f, 1.0f) : 0.0f;
+			const std::string overlay = std::format("{:.0f} / {:.0f}   {} ({}/{})", f.need[n], f.cap[n], StageName(n, f.stage[n]), f.stage[n], f.maxStage[n]);
+			Gui::PushStyleColor(Gui::ImGuiCol_PlotHistogram, StageColor(f.stage[n], f.maxStage[n]));
+			Gui::ProgressBar(frac, Gui::ImVec2{ -FLT_MIN, 0.0f }, overlay.c_str());
+			Gui::PopStyleColor();
+		}
+
+		void __stdcall DrawStatus()
+		{
+			LangBar();
+			GlobalView g;
+			std::vector<FollowerView> v;
+			{
+				std::lock_guard lk(viewMtx);
+				g = gview;
+				v = views;
+			}
+			Heading(TR("Followers", "追随者状态"));
+			if (!g.ready) {
+				Wrapped(TR("Waiting for data - load a save and wait a second.", "等待数据中：请读取存档并稍等片刻。"));
+				return;
+			}
+			Txt(std::format("RND: {}", g.rndActive ? TR("active", "运行中") : TR("paused (RND_State = 0), needs are frozen", "已暂停（RND_State = 0），需求不增长")));
+			Txt(std::format("{}: {:.1f} / {:.1f} / {:.1f}  ({})", TR("Speed per hour (hunger / thirst / fatigue)", "每小时增长（饥饿 / 口渴 / 疲劳）"),
+				g.baseRate[0] * cfg.rateMult[0], g.baseRate[1] * cfg.rateMult[1], g.baseRate[2] * cfg.rateMult[2], TR("RND base x your multiplier", "RND 基础值 x 你的倍率")));
+			if (g.lastJumpHours > 0.0f)
+				Txt(std::format("{}: {:.1f} h, {}: {:.1f} h", TR("Last time jump detected (fast travel etc.)", "最近一次检测到的跳时（快速旅行等）"), g.lastJumpHours,
+					TR("counted for needs", "计入需求"), g.lastJumpCounted));
+
+			if (v.empty()) {
+				Gui::Spacing();
+				Wrapped(TR("No tracked followers right now. Recruit a follower and stay in the same area.", "目前没有被追踪的追随者。请招募追随者并让他们在附近。"));
+				return;
+			}
+			for (const auto& f : v) {
+				Gui::PushID(static_cast<int>(f.id));
+				const std::string head = std::format("{}##hdr", f.name);
+				if (Gui::CollapsingHeader(head.c_str(), Gui::ImGuiTreeNodeFlags_DefaultOpen)) {
+					Txt(std::format("{:08X}   {}{}", f.id, f.sleeping ? TR("[resting] ", "[休息中] ") : "", f.combat ? TR("[in combat]", "[战斗中]") : ""));
+					for (int n = 0; n < 3; ++n) NeedBar(f, n);
+
+					if (f.disease >= 0) {
+						const float left = (f.counter < 2 && cfg.stageHours > 0.0f) ? std::max(0.0f, cfg.stageHours - f.timer) : 0.0f;
+						std::string line = std::format("{}: {}  ({} {}/3)", TR("Disease", "疾病"), kDiseaseNames[std::clamp(f.disease, 0, 5)], TR("stage", "阶段"), f.dStage + 1);
+						if (left > 0.0f) line += std::format("  - {} {:.1f} h", TR("next stage in", "距下一阶段"), left);
+						Gui::TextColored(kBad, "%s", line.c_str());
+					} else {
+						Gui::TextColored(kGood, "%s", TR("Disease: none", "疾病：无"));
+					}
+
+					Gui::Spacing();
+					Gui::TextColored(kHead, "%s", TR("Abilities / debuffs on this follower (checked in game):", "此追随者身上实际挂着的能力 / debuff（游戏内检查）："));
+					if (f.abilities.empty()) {
+						Wrapped(TR("(none)", "（无）"));
+					} else {
+						for (const auto& ab : f.abilities) {
+							Gui::BulletText("%s", AbilityLabel(ab).c_str());
+							if (!ab.fx.empty()) {
+								Gui::Indent(28.0f);
+								for (const auto& e : ab.fx) Gui::Text("%s", e.c_str());
+								Gui::Unindent(28.0f);
+							}
+						}
+					}
+				}
+				Gui::PopID();
+			}
+		}
+
+		void __stdcall DrawSettings()
+		{
+			LangBar();
+			GlobalView g;
+			{
+				std::lock_guard lk(viewMtx);
+				g = gview;
+			}
+
+			Heading(TR("Need speed", "需求增长速度"));
+			Wrapped(TR("Multiplier on top of RND's own rate. 1.0 = same as RND, 0 = that need never grows. Ctrl+Click a slider to type a value.",
+				"在 RND 原有速度上的倍率。1.0 = 与 RND 相同，0 = 该需求不再增长。按住 Ctrl 点击滑条可直接输入数值。"));
+			Gui::Spacing();
+			for (int n = 0; n < 3; ++n) {
+				Gui::PushID(n);
+				Gui::Text("%s", NeedName(n));
+				Gui::SameLine(90.0f);
+				Gui::SetNextItemWidth(260.0f);
+				if (Gui::SliderFloat("##rate", &cfg.rateMult[n], 0.0f, 5.0f, "%.2fx")) MarkDirty();
+				Gui::SameLine();
+				Txt(std::format("RND {:.1f}/h  ->  {:.1f}/h", g.baseRate[n], g.baseRate[n] * cfg.rateMult[n]));
+				Gui::PopID();
+			}
+			if (Gui::Button(TR("Reset all speeds to 1.0", "全部恢复为 1.0"))) {
+				for (auto& m : cfg.rateMult) m = 1.0f;
+				MarkDirty();
+			}
+
+			Heading(TR("Fast travel", "快速旅行"));
+			if (Gui::Checkbox(TR("Slow down needs during fast travel", "快速旅行时减缓需求增长"), &cfg.fastTravelSlow)) MarkDirty();
+			Gui::BeginDisabled(!cfg.fastTravelSlow);
+			Gui::Text("%s", TR("Share of travel time that counts", "旅行时间计入需求的比例"));
+			Gui::SameLine();
+			Gui::SetNextItemWidth(220.0f);
+			if (Gui::SliderFloat("##ft", &cfg.fastTravelMult, 0.0f, 1.0f, "%.2f")) MarkDirty();
+			Gui::EndDisabled();
+			Wrapped(TR("0 = needs do not grow while fast travelling, 1 = same as normal. A fast travel is detected as a large jump of game time that is not sleeping or waiting, so other big time skips (e.g. carriage rides) are treated the same way.",
+				"0 = 快速旅行期间需求完全不增长，1 = 与平时相同。快速旅行是通过“游戏时间一次大幅跳跃，且不是睡觉或等待”来判断的，因此马车等其他大幅跳时也会被同样处理。"));
+
+			Heading(TR("Notifications", "提示消息"));
+			if (Gui::Checkbox(TR("Show notifications (e.g. \"X is hungry\")", "显示提示（例如“某某很饿”）"), &cfg.notify)) MarkDirty();
+			Gui::Text("%s", TR("Show from stage", "从该阶段开始提示"));
+			Gui::SameLine();
+			Gui::SetNextItemWidth(160.0f);
+			if (Gui::SliderInt("##ns", &cfg.notifyStage, 1, 5, "%d")) MarkDirty();
+
+			Heading(TR("Saving", "保存"));
+			Wrapped(TR("Changes apply immediately and are saved automatically to Data/SKSE/Plugins/RNDFollowers_User.ini.",
+				"修改会立即生效，并自动保存到 Data/SKSE/Plugins/RNDFollowers_User.ini。"));
+			if (Gui::Button(TR("Save now", "立即保存"))) SaveUserConfig();
+		}
+
+		void __stdcall DrawDisease()
+		{
+			LangBar();
+			GlobalView g;
+			{
+				std::lock_guard lk(viewMtx);
+				g = gview;
+			}
+			Heading(TR("Disease system", "疾病系统"));
+			if (Gui::Checkbox(TR("Enable disease system (new infections)", "启用疾病系统（新的感染）"), &cfg.diseaseEnabled)) MarkDirty();
+			Wrapped(TR("Turning this off only stops NEW infections. Followers that are already sick keep progressing and can still be cured.",
+				"关闭只会阻止新的感染。已经生病的追随者仍会继续发展，也仍可被治愈。"));
+
+			Heading(TR("Infection sources", "感染来源"));
+			Gui::BeginDisabled(!cfg.diseaseEnabled);
+			auto pct = [&](float base) { return std::clamp(base * cfg.diseaseChanceMult, 0.0f, 100.0f); };
+			if (Gui::Checkbox(TR("Raw food", "吃生食"), &cfg.infectRaw)) MarkDirty();
+			Gui::SameLine();
+			Txt(std::format("  {:.0f}%", pct(g.chance[0])));
+			if (Gui::Checkbox(TR("Spoiled food", "吃变质的食物"), &cfg.infectStale)) MarkDirty();
+			Gui::SameLine();
+			Txt(std::format("  {:.0f}%", pct(g.chance[1])));
+			if (Gui::Checkbox(TR("River / stream water", "喝溪水 / 河水"), &cfg.infectRiver)) MarkDirty();
+			Gui::SameLine();
+			Txt(std::format("  {:.0f}%", pct(g.chance[2])));
+			if (Gui::Checkbox(TR("Wounds from animals / undead", "被动物 / 亡灵攻击"), &cfg.infectHit)) MarkDirty();
+			Gui::SameLine();
+			Txt(std::format("  {:.1f}% {}", cfg.hitDiseaseChance * cfg.diseaseChanceMult, TR("per hit, before resistance", "每次命中，未计抗病")));
+			if (Gui::Checkbox(TR("Neglect (starving, parched or exhausted)", "长期忽视需求（极度饥饿 / 干渴 / 疲惫）"), &cfg.infectNeglect)) MarkDirty();
+
+			Gui::Spacing();
+			Gui::Text("%s", TR("Chance multiplier", "感染几率倍率"));
+			Gui::SameLine();
+			Gui::SetNextItemWidth(220.0f);
+			if (Gui::SliderFloat("##dm", &cfg.diseaseChanceMult, 0.0f, 3.0f, "%.2fx")) MarkDirty();
+			Gui::EndDisabled();
+			Wrapped(TR("The percentages are RND's own chances (raw / spoiled / river) multiplied by this value. Use the Debug page to infect or cure a follower on demand.",
+				"百分比为 RND 自己的感染几率（生食 / 变质 / 河水）乘以该倍率。想立刻让追随者患病或治愈，请用 Debug 页面。"));
+		}
+
+		void __stdcall DrawDebug()
+		{
+			LangBar();
+			GlobalView g;
+			std::vector<FollowerView> v;
+			{
+				std::lock_guard lk(viewMtx);
+				g = gview;
+				v = views;
+			}
+			Heading(TR("All followers", "所有追随者"));
+			if (Gui::Button(TR("Reset all needs to 0", "全部需求归零"))) QueueAction(Action{ ActType::ResetNeeds, 0, 0, 0.0f });
+			Gui::SameLine();
+			if (Gui::Button(TR("Cure all diseases", "治愈所有疾病"))) QueueAction(Action{ ActType::Cure, 0, 0, 0.0f });
+			Gui::SameLine();
+			if (Gui::Button(TR("Reload INI files", "重新读取 INI"))) QueueAction(Action{ ActType::ReloadConfig, 0, 0, 0.0f });
+
+			static int stageSel = 3;
+			static int diseaseSel = 0;
+			Heading(TR("Test values", "测试数值"));
+			Gui::Text("%s", TR("Target stage for the Hungry / Thirsty / Tired buttons", "“饥饿 / 口渴 / 疲劳”按钮要设置到的阶段"));
+			Gui::SetNextItemWidth(160.0f);
+			Gui::SliderInt("##stage", &stageSel, 1, 5, "%d");
+			Gui::Text("%s", TR("Disease for the Infect button", "“感染”按钮使用的疾病"));
+			Gui::SetNextItemWidth(220.0f);
+			Gui::Combo("##dis", &diseaseSel, "Random\0Witbane\0Rockjoint\0Rattles\0BrainRot\0BoneBreakFever\0Ataxia\0");
+
+			Heading(TR("Per follower", "单个追随者"));
+			if (v.empty()) {
+				Wrapped(TR("No tracked followers right now.", "目前没有被追踪的追随者。"));
+				return;
+			}
+			for (const auto& f : v) {
+				Gui::PushID(static_cast<int>(f.id));
+				Txt(f.name);
+				const int hs = std::clamp(stageSel, 0, 5), ts = std::clamp(stageSel, 0, 4), fs = std::clamp(stageSel, 0, 4);
+				if (Gui::Button(TR("Hungry", "饥饿"))) QueueAction(Action{ ActType::SetNeed, f.id, 0, g.hLv[hs] });
+				Gui::SameLine();
+				if (Gui::Button(TR("Thirsty", "口渴"))) QueueAction(Action{ ActType::SetNeed, f.id, 1, g.tLv[ts] });
+				Gui::SameLine();
+				if (Gui::Button(TR("Tired", "疲劳"))) QueueAction(Action{ ActType::SetNeed, f.id, 2, g.sLv[fs] });
+				Gui::SameLine();
+				if (Gui::Button(TR("Reset needs", "需求归零"))) QueueAction(Action{ ActType::ResetNeeds, f.id, 0, 0.0f });
+				Gui::SameLine();
+				if (Gui::Button(TR("Infect", "感染"))) QueueAction(Action{ ActType::Infect, f.id, diseaseSel - 1, 0.0f });
+				Gui::SameLine();
+				if (Gui::Button(TR("Cure", "治愈"))) QueueAction(Action{ ActType::Cure, f.id, 0, 0.0f });
+				Gui::Spacing();
+				Gui::PopID();
+			}
+		}
+
+		void Register()
+		{
+			SKSEMenuFramework::SetSection("RND Followers");
+			SKSEMenuFramework::AddSectionItem("Status", DrawStatus);
+			SKSEMenuFramework::AddSectionItem("Needs and Speed", DrawSettings);
+			SKSEMenuFramework::AddSectionItem("Disease", DrawDisease);
+			SKSEMenuFramework::AddSectionItem("Debug", DrawDebug);
+		}
+	}
+
 	// ----------------------------------------------------------------- startup
 	void SetupLog()
 	{
@@ -691,6 +1272,14 @@ namespace
 			src->AddEventSink<RE::TESHitEvent>(&sinks);
 			src->AddEventSink<RE::TESSleepStartEvent>(&sinks);
 			src->AddEventSink<RE::TESSleepStopEvent>(&sinks);
+			logger::info("menu settings: speed x{:.2f}/{:.2f}/{:.2f}, fast-travel slow={} (x{:.2f}), disease enabled={}", cfg.rateMult[0], cfg.rateMult[1],
+				cfg.rateMult[2], cfg.fastTravelSlow, cfg.fastTravelMult, cfg.diseaseEnabled);
+			if (GetMenuFrameworkModule()) {
+				Menu::Register();
+				logger::info("SKSE Menu Framework found (version {}) - menu registered under \"RND Followers\"", SKSEMenuFramework::GetMenuFrameworkVersion());
+			} else {
+				logger::info("SKSE Menu Framework not found - in-game menu disabled, everything else works as before");
+			}
 			std::thread([] {
 				while (true) {
 					std::this_thread::sleep_for(std::chrono::milliseconds(std::max(250, cfg.tickMs)));
