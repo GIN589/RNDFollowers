@@ -40,6 +40,8 @@ namespace
 		int   tickMs{ 1000 };
 		bool  uninstall{ false };
 		bool  respectRndState{ true };
+		bool  verbose{ true };            // detailed log in RNDFollowers.log
+		int   summarySeconds{ 30 };       // real seconds between follower summary lines (0 = off)
 		bool  fullStomachSlow{ false };   // hunger stage 0 ability (RND slows the player when full)
 		float startNeed[3]{ 20.0f, 20.0f, 10.0f };
 		float sleepRadius{ 1500.0f };
@@ -57,6 +59,12 @@ namespace
 		std::string msgRecovered{ "recovered from {}" };
 	};
 	Config cfg;
+
+	template <class... A>
+	void Dbg(std::format_string<A...> f, A&&... a)
+	{
+		if (cfg.verbose) logger::info("{}", std::format(f, std::forward<A>(a)...));
+	}
 
 	std::vector<std::string> ParseList(const std::string& s)
 	{
@@ -89,6 +97,8 @@ namespace
 		cfg.tickMs = (int)ini.GetLongValue("General", "TickMs", cfg.tickMs);
 		cfg.uninstall = B("General", "Uninstall", cfg.uninstall);
 		cfg.respectRndState = B("General", "OnlyWhenRNDActive", cfg.respectRndState);
+		cfg.verbose = B("Log", "Verbose", cfg.verbose);
+		cfg.summarySeconds = (int)ini.GetLongValue("Log", "SummarySeconds", cfg.summarySeconds);
 		cfg.fullStomachSlow = B("General", "ApplyFullStomachSlow", cfg.fullStomachSlow);
 		cfg.startNeed[0] = F("Start", "Hunger", cfg.startNeed[0]);
 		cfg.startNeed[1] = F("Start", "Thirst", cfg.startNeed[1]);
@@ -252,9 +262,15 @@ namespace
 	{
 		for (size_t i = 0; i < n; ++i) {
 			auto* s = all[i];
-			if (s && s != want && a->HasSpell(s)) a->RemoveSpell(s);
+			if (s && s != want && a->HasSpell(s)) {
+				a->RemoveSpell(s);
+				Dbg("{}: removed ability {:08X} (still present: {})", a->GetDisplayFullName(), s->GetFormID(), a->HasSpell(s));
+			}
 		}
-		if (want && !a->HasSpell(want)) a->AddSpell(want);
+		if (want && !a->HasSpell(want)) {
+			a->AddSpell(want);
+			Dbg("{}: added ability {:08X} (present now: {})", a->GetDisplayFullName(), want->GetFormID(), a->HasSpell(want));
+		}
 	}
 
 	void StripAll(RE::Actor* a)
@@ -279,8 +295,13 @@ namespace
 				if (!sp) continue;
 				const bool want = (d == r.disease) && (s <= r.dStage);
 				const bool has = a->HasSpell(sp);
-				if (want && !has) a->AddSpell(sp);
-				else if (!want && has) a->RemoveSpell(sp);
+				if (want && !has) {
+					a->AddSpell(sp);
+					Dbg("{}: added disease ability {:08X} (present now: {})", a->GetDisplayFullName(), sp->GetFormID(), a->HasSpell(sp));
+				} else if (!want && has) {
+					a->RemoveSpell(sp);
+					Dbg("{}: removed disease ability {:08X}", a->GetDisplayFullName(), sp->GetFormID());
+				}
 			}
 	}
 
@@ -292,6 +313,7 @@ namespace
 		r.counter = 0;
 		r.timer = 0;
 		const char* nm = kDiseaseNames[r.disease];
+		Dbg("{}: infected with {} ({})", a->GetDisplayFullName(), nm, cause);
 		Say(a, std::vformat(cfg.msgInfected, std::make_format_args(nm)) + " (" + cause + ")");
 	}
 
@@ -299,11 +321,40 @@ namespace
 	{
 		if (r.disease < 0) return;
 		const char* nm = kDiseaseNames[r.disease];
+		Dbg("{}: recovered from {}", a->GetDisplayFullName(), nm);
 		Say(a, std::vformat(cfg.msgRecovered, std::make_format_args(nm)));
 		r.disease = -1;
 		r.dStage = -1;
 		r.counter = 0;
 		r.timer = 0;
+	}
+
+	const char* WhyNot(RE::Actor* a)
+	{
+		if (!a) return "null";
+		if (a->IsDead()) return "dead";
+		if (a->IsPlayerRef()) return "is the player";
+		if (!a->IsPlayerTeammate()) return "not a player teammate (dismissed or not a follower)";
+		if (a->IsCommandedActor()) return "commanded/summoned actor";
+		if (!cfg.includeAnimals && RaceHas(a, "ActorTypeAnimal")) return "animal (IncludeAnimals=false)";
+		return "uninstall mode";
+	}
+
+	void LogSummary(RE::Actor* a, const Record& r)
+	{
+		std::string ab;
+		auto add = [&](RE::SpellItem* sp, const std::string& label) { if (sp && a->HasSpell(sp)) ab += label + " "; };
+		for (int i = 0; i < 6; ++i) add(R.hunger[i], std::format("Hunger{}", i));
+		for (int i = 0; i < 5; ++i) add(R.thirst[i], std::format("Thirst{}", i));
+		for (int i = 0; i < 5; ++i) add(R.sleep[i], std::format("Fatigue{}", i));
+		for (int d = 0; d < 6; ++d)
+			for (int k = 0; k < 3; ++k) add(R.disease[d][k], std::format("{}{}", kDiseaseNames[d], k));
+		if (ab.empty()) ab = "(none)";
+		Dbg("[summary] {} {:08X} | hunger {:.0f} (stage {}) | thirst {:.0f} (stage {}) | fatigue {:.0f} (stage {}) | disease {} (stage {}) | abilities: {}",
+			a->GetDisplayFullName(), a->GetFormID(),
+			r.need[kHunger], StageOf(r.need[kHunger], R.hLvl), r.need[kThirst], StageOf(r.need[kThirst], R.tLvl),
+			r.need[kFatigue], StageOf(r.need[kFatigue], R.sLvl),
+			r.disease >= 0 ? kDiseaseNames[r.disease] : "none", r.dStage, ab);
 	}
 
 	// -------------------------------------------------------------------- tick
@@ -325,6 +376,16 @@ namespace
 
 		const float caps[3]{ Val(R.hLvl[5], 240), Val(R.tLvl[4], 240), Val(R.sLvl[4], 240) };
 
+		static auto lastSummary = std::chrono::steady_clock::now();
+		static std::unordered_set<RE::FormID> skipLogged;
+		bool doSummary = false;
+		if (cfg.verbose && cfg.summarySeconds > 0 &&
+		    std::chrono::steady_clock::now() - lastSummary >= std::chrono::seconds(cfg.summarySeconds)) {
+			doSummary = true;
+			lastSummary = std::chrono::steady_clock::now();
+			Dbg("[summary] RND_State={} tracked followers={}", Val(R.state, -1.0f), state.size());
+		}
+
 		for (auto& handle : lists->highActorHandles) {
 			auto ptr = handle.get();
 			auto* a = ptr.get();
@@ -333,13 +394,22 @@ namespace
 			auto it = state.find(id);
 
 			if (cfg.uninstall || !IsFollower(a)) {
-				if (it != state.end()) { StripAll(a); state.erase(it); }
+				if (it != state.end()) {
+					Dbg("stop tracking {} {:08X}: {}", a->GetDisplayFullName(), id, WhyNot(a));
+					StripAll(a);
+					state.erase(it);
+				} else if (a->IsPlayerTeammate() && !a->IsPlayerRef() && skipLogged.insert(id).second) {
+					Dbg("teammate {} {:08X} is not tracked: {}", a->GetDisplayFullName(), id, WhyNot(a));
+				}
 				continue;
 			}
 			if (it == state.end()) {
 				Record fresh;
 				for (int n = 0; n < 3; ++n) fresh.need[n] = cfg.startNeed[n];
 				it = state.emplace(id, fresh).first;
+				skipLogged.erase(id);
+				Dbg("start tracking follower {} {:08X} (start hunger {:.0f}, thirst {:.0f}, fatigue {:.0f})", a->GetDisplayFullName(), id,
+					fresh.need[0], fresh.need[1], fresh.need[2]);
 			}
 			auto& r = it->second;
 
@@ -387,6 +457,7 @@ namespace
 			}
 
 			ApplyAbilities(a, r);
+			if (doSummary) LogSummary(a, r);
 		}
 	}
 
@@ -413,9 +484,10 @@ namespace
 			auto& r = it->second;
 			if (r.disease >= 0 && r.sleptThisRest && r.counter > 3) {
 				const int adjust = (r.counter - 3) + bonus;
-				if (RandInt(0, 9) + adjust > (int)Val(R.disFatigue, 1.0f)) {
-					if (--r.dStage < 0) Cure(a, r);
-				}
+				const bool better = RandInt(0, 9) + adjust > (int)Val(R.disFatigue, 1.0f);
+				Dbg("{} slept with {} (counter {}, adjust {}): {}", a->GetDisplayFullName(), kDiseaseNames[r.disease], r.counter, adjust,
+					better ? "improves" : "no change");
+				if (better && --r.dStage < 0) Cure(a, r);
 			}
 			r.sleptThisRest = false;
 		}
@@ -435,11 +507,17 @@ namespace
 			auto* a = e->actor->As<RE::Actor>();
 			if (!a) return BSEventNotifyControl::kContinue;
 
-			std::lock_guard lk(mtx);
-			auto it = state.find(a->GetFormID());
-			if (it == state.end()) return BSEventNotifyControl::kContinue;
 			auto* alch = RE::TESForm::LookupByID<RE::AlchemyItem>(e->baseObject);
 			if (!alch || alch->IsPoison()) return BSEventNotifyControl::kContinue;
+
+			std::lock_guard lk(mtx);
+			auto it = state.find(a->GetFormID());
+			if (it == state.end()) {
+				if (cfg.verbose && a->IsPlayerTeammate())
+					Dbg("consume event by UNTRACKED teammate {} {:08X}: {} ({:08X})", a->GetDisplayFullName(), a->GetFormID(),
+						alch->GetName(), e->baseObject);
+				return BSEventNotifyControl::kContinue;
+			}
 
 			// ignore duplicate equip events fired for the same item within half a second
 			static std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> last;
@@ -451,9 +529,12 @@ namespace
 			auto& r = it->second;
 			float food = 0, water = 0;
 			bool eats = false, drinks = false, raw = false, stale = false, river = false, cure = false;
+			std::string fxList;
+			const float h0 = r.need[kHunger], t0 = r.need[kThirst];
 			for (auto* eff : alch->effects) {
 				if (!eff || !eff->baseEffect) continue;
 				const auto fx = eff->baseEffect->GetFormID();
+				if (cfg.verbose) fxList += std::format("{:08X} ", fx);
 				if (auto f = R.foodFx.find(fx); f != R.foodFx.end()) { food += Val(f->second); eats = true; }
 				else if (auto w = R.waterFx.find(fx); w != R.waterFx.end()) { water += Val(w->second); drinks = true; }
 				else if (fx == R.rawFx) raw = true;
@@ -467,6 +548,13 @@ namespace
 			if (raw && Roll(Val(R.chRaw))) Infect(a, r, "raw food");
 			if (stale && Roll(Val(R.chStale))) Infect(a, r, "stale food");
 			if (river && Roll(Val(R.chRiver))) Infect(a, r, "river water");
+			if (eats || drinks || cure || raw || stale || river)
+				Dbg("{} consumed {} ({:08X}): food {:.0f}, water {:.0f}, cure {}, raw {}, stale {}, river {} | hunger {:.0f} -> {:.0f}, thirst {:.0f} -> {:.0f}",
+					a->GetDisplayFullName(), alch->GetName(), e->baseObject, food, water, cure, raw, stale, river,
+					h0, r.need[kHunger], t0, r.need[kThirst]);
+			else
+				Dbg("{} used {} ({:08X}) - no RND food/drink effect recognised; its effects: {}", a->GetDisplayFullName(),
+					alch->GetName(), e->baseObject, fxList.empty() ? "(none)" : fxList);
 			return BSEventNotifyControl::kContinue;
 		}
 
@@ -485,6 +573,7 @@ namespace
 			for (auto& kw : cfg.diseaseSources) if (RaceHas(attacker, kw)) { source = true; break; }
 			if (!source) return BSEventNotifyControl::kContinue;
 			const float resist = std::clamp(victim->AsActorValueOwner()->GetActorValue(RE::ActorValue::kResistDisease), 0.0f, 100.0f);
+			Dbg("{} was hit by disease source {}, resist {:.0f}", victim->GetDisplayFullName(), attacker->GetDisplayFullName(), resist);
 			if (Roll(cfg.hitDiseaseChance * (1.0f - resist / 100.0f))) Infect(victim, it->second, "wounded");
 			return BSEventNotifyControl::kContinue;
 		}
@@ -493,12 +582,14 @@ namespace
 		{
 			std::lock_guard lk(mtx);
 			playerSleeping = true;
+			Dbg("player started sleeping");
 			return RE::BSEventNotifyControl::kContinue;
 		}
 
 		RE::BSEventNotifyControl ProcessEvent(const RE::TESSleepStopEvent*, RE::BSTEventSource<RE::TESSleepStopEvent>*) override
 		{
 			SKSE::GetTaskInterface()->AddTask([] {
+				Dbg("player stopped sleeping");
 				Tick();           // credit the slept hours first
 				SleepCure();
 				std::lock_guard lk(mtx);
@@ -588,6 +679,13 @@ namespace
 		case SKSE::MessagingInterface::kDataLoaded: {
 			LoadConfig();
 			ResolveForms();
+			logger::info("settings: verbose={}, summary every {}s, notify from stage {}, uninstall={}", cfg.verbose, cfg.summarySeconds,
+				cfg.notifyStage, cfg.uninstall);
+			logger::info("RND: state={} rates H/T/F={}/{}/{} per hour, hunger stage thresholds={}/{}/{}/{}/{}",
+				Val(R.state, -1.0f), Val(R.rate[0]), Val(R.rate[1]), Val(R.rate[2]), Val(R.hLvl[1]), Val(R.hLvl[2]), Val(R.hLvl[3]),
+				Val(R.hLvl[4]), Val(R.hLvl[5]));
+			logger::info("RND food effects known: {}, water effects known: {}, cure effects known: {}", R.foodFx.size(), R.waterFx.size(),
+				R.cureFx.size());
 			auto* src = RE::ScriptEventSourceHolder::GetSingleton();
 			src->AddEventSink<RE::TESEquipEvent>(&sinks);
 			src->AddEventSink<RE::TESHitEvent>(&sinks);
