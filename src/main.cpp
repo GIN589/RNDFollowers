@@ -382,7 +382,7 @@ namespace
 	{
 		if (!cfg.notify || what.empty()) return;
 		const auto msg = std::format("{} {}", a->GetDisplayFullName(), what);
-		RE::DebugNotification(msg.c_str());
+		RE::SendHUDMessage::ShowHUDMessage(msg.c_str());
 	}
 
 	// ------------------------------------------------------------- abilities
