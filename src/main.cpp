@@ -59,6 +59,7 @@ namespace
 		float sleepMult[2]{ 0.5f, 0.5f };
 		float combatFatigueMult{ 1.5f };
 		float hitDiseaseChance{ 4.0f };
+		float hitRollDelay{ 10.0f };   // seconds: hits from disease sources are rolled after the fight, or after this long if it goes on (0 = roll on every hit at once)
 		float stageHours{ 6.0f };
 		bool  diseaseAddsFatigue{ true };
 		// --- editable from the in-game menu (stored in RNDFollowers_User.ini)
@@ -133,6 +134,7 @@ namespace
 		cfg.sleepMult[1] = F("Sleep", "SleepThirstMult", cfg.sleepMult[1]);
 		cfg.combatFatigueMult = F("Sleep", "CombatFatigueMult", cfg.combatFatigueMult);
 		cfg.hitDiseaseChance = F("Disease", "ChancePerHitPct", cfg.hitDiseaseChance);
+		cfg.hitRollDelay = std::clamp(F("Disease", "HitRollDelaySeconds", cfg.hitRollDelay), 0.0f, 600.0f);
 		cfg.stageHours = F("Disease", "HoursPerStage", cfg.stageHours);
 		cfg.diseaseAddsFatigue = B("Disease", "DiseaseAddsFatigue", cfg.diseaseAddsFatigue);
 		if (auto* p = ini.GetValue("Disease", "SourceRaceKeywords")) { auto l = ParseList(p); if (!l.empty()) cfg.diseaseSources = l; }
@@ -344,6 +346,8 @@ namespace
 		float lastAutoEat{ -1000.0f };   // game hours of the last auto-eat attempt (not saved)
 		float missedDt{ 0 }, missedNeedDt{ 0 };   // game hours that passed while she was not loaded (not saved)
 		bool  noCureLogged{ false };
+		int   pendingHits{ 0 };   // hits taken from disease sources that are waiting for their infection roll (not saved)
+		std::chrono::steady_clock::time_point firstPendingHit{};
 	};
 
 	std::recursive_mutex mtx;
@@ -916,6 +920,21 @@ namespace
 				if (Roll(p * cfg.diseaseChanceMult)) Infect(a, r, "weakened by neglect");
 			}
 
+			// wounds from disease sources: roll once the fight is over, or every hitRollDelay seconds while it goes on
+			if (r.pendingHits > 0) {
+				if (r.disease >= 0 || a->IsDead()) {
+					r.pendingHits = 0;
+				} else if (!a->IsInCombat() || std::chrono::duration<float>(nowReal - r.firstPendingHit).count() >= cfg.hitRollDelay) {
+					const float resist = std::clamp(a->AsActorValueOwner()->GetActorValue(RE::ActorValue::kResistDisease), 0.0f, 100.0f);
+					const float each = std::clamp(cfg.hitDiseaseChance * cfg.diseaseChanceMult * (1.0f - resist / 100.0f), 0.0f, 100.0f) / 100.0f;
+					const float total = 100.0f * (1.0f - std::pow(1.0f - each, static_cast<float>(r.pendingHits)));
+					Dbg("{}: rolling infection for {} wound(s): {:.1f}% each, {:.1f}% together (resist {:.0f}){}", a->GetDisplayFullName(), r.pendingHits,
+						each * 100.0f, total, resist, a->IsInCombat() ? " [fight still going]" : " [fight over]");
+					r.pendingHits = 0;
+					if (Roll(total)) Infect(a, r, "wounded");
+				}
+			}
+
 			ApplyAbilities(a, r);
 			if (doSummary) LogSummary(a, r);
 			newViews.push_back(BuildView(a, r, sleeping));
@@ -1028,6 +1047,15 @@ namespace
 			bool source = false;
 			for (auto& kw : cfg.diseaseSources) if (RaceHas(attacker, kw)) { source = true; break; }
 			if (!source) return BSEventNotifyControl::kContinue;
+			if (cfg.hitRollDelay > 0.0f) {
+				// do not roll the instant the monster lands its first blow: collect the hits, Tick() rolls them later
+				auto& rec = it->second;
+				if (rec.pendingHits == 0) rec.firstPendingHit = std::chrono::steady_clock::now();
+				++rec.pendingHits;
+				Dbg("{} was hit by disease source {} (wound #{} waiting for its infection roll)", victim->GetDisplayFullName(), attacker->GetDisplayFullName(),
+					rec.pendingHits);
+				return BSEventNotifyControl::kContinue;
+			}
 			const float resist = std::clamp(victim->AsActorValueOwner()->GetActorValue(RE::ActorValue::kResistDisease), 0.0f, 100.0f);
 			Dbg("{} was hit by disease source {}, resist {:.0f}", victim->GetDisplayFullName(), attacker->GetDisplayFullName(), resist);
 			if (Roll(cfg.hitDiseaseChance * cfg.diseaseChanceMult * (1.0f - resist / 100.0f))) Infect(victim, it->second, "wounded");
