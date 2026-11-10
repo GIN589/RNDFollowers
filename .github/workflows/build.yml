@@ -5,31 +5,34 @@ on:
   push:
     branches: [main, master]
 
-env:
-  # CommonLibSSE-NG release to build against (alandtse/CommonLibSSE-NG). Reads Address Library formats 1, 2 and 5.
-  COMMONLIB_TAG: v15.4.0
-
 jobs:
   build:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
 
-      - name: Get CommonLibSSE-NG
+      - name: Configure vcpkg registry
         shell: bash
         run: |
           set -e
-          rm -rf extern/CommonLibSSE-NG
-          git clone --depth 1 --branch "$COMMONLIB_TAG" --recurse-submodules --shallow-submodules \
-            https://github.com/alandtse/CommonLibSSE-NG.git extern/CommonLibSSE-NG
-          git -C extern/CommonLibSSE-NG log -1 --oneline
-
-      - name: Configure vcpkg
-        shell: bash
-        run: |
-          set -e
-          vbase=$(git -C "$VCPKG_INSTALLATION_ROOT" rev-parse HEAD)
-          printf '{"default-registry":{"kind":"builtin","baseline":"%s"}}\n' "$vbase" > vcpkg-configuration.json
+          found=0
+          for url in https://gitlab.com/colorglass/vcpkg-colorglass; do
+            echo "Trying $url"
+            rm -rf reg
+            if git clone --depth 1 "$url" reg 2>/dev/null && [ -d reg/ports/commonlibsse-ng ]; then
+              baseline=$(git -C reg rev-parse HEAD)
+              vbase=$(git -C "$VCPKG_INSTALLATION_ROOT" rev-parse HEAD)
+              pkgs=$(ls reg/ports | sed 's/.*/"&"/' | paste -sd, -)
+              printf '{"default-registry":{"kind":"builtin","baseline":"%s"},"registries":[{"kind":"git","repository":"%s","baseline":"%s","packages":[%s]}]}\n' "$vbase" "$url" "$baseline" "$pkgs" > vcpkg-configuration.json
+              echo "Using registry $url at $baseline"
+              found=1
+              break
+            fi
+          done
+          if [ "$found" -ne 1 ]; then
+            echo "No registry containing commonlibsse-ng was found"
+            exit 1
+          fi
           cat vcpkg-configuration.json
 
       - name: Configure
