@@ -386,7 +386,11 @@ namespace
 	{
 		if (!cfg.notify || what.empty()) return;
 		const auto msg = std::format("{} {}", a->GetDisplayFullName(), what);
+#ifdef RND_NEW_COMMONLIB   // set by the 1.7.x build (CMakeLists.txt): alandtse CommonLibSSE-NG renamed the function
 		RE::SendHUDMessage::ShowHUDMessage(msg.c_str());
+#else
+		RE::DebugNotification(msg.c_str());
+#endif
 	}
 
 	// ------------------------------------------------------------- abilities
