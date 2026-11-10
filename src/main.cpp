@@ -59,6 +59,8 @@ namespace
 		float sleepMult[2]{ 0.5f, 0.5f };
 		float combatFatigueMult{ 1.5f };
 		float hitDiseaseChance{ 4.0f };
+		float hitQuiet{ 5.0f };        // seconds without a new wound (and out of combat) before the fight counts as over
+		float hitMinInterval{ 0.5f };  // seconds: wounds closer together than this count as one (the game can fire many hit events per second)
 		float hitRollDelay{ 10.0f };   // seconds: hits from disease sources are rolled after the fight, or after this long if it goes on (0 = roll on every hit at once)
 		float stageHours{ 6.0f };
 		bool  diseaseAddsFatigue{ true };
@@ -135,6 +137,8 @@ namespace
 		cfg.combatFatigueMult = F("Sleep", "CombatFatigueMult", cfg.combatFatigueMult);
 		cfg.hitDiseaseChance = F("Disease", "ChancePerHitPct", cfg.hitDiseaseChance);
 		cfg.hitRollDelay = std::clamp(F("Disease", "HitRollDelaySeconds", cfg.hitRollDelay), 0.0f, 600.0f);
+		cfg.hitQuiet = std::clamp(F("Disease", "HitQuietSeconds", cfg.hitQuiet), 0.0f, 60.0f);
+		cfg.hitMinInterval = std::clamp(F("Disease", "HitMinIntervalSeconds", cfg.hitMinInterval), 0.0f, 10.0f);
 		cfg.stageHours = F("Disease", "HoursPerStage", cfg.stageHours);
 		cfg.diseaseAddsFatigue = B("Disease", "DiseaseAddsFatigue", cfg.diseaseAddsFatigue);
 		if (auto* p = ini.GetValue("Disease", "SourceRaceKeywords")) { auto l = ParseList(p); if (!l.empty()) cfg.diseaseSources = l; }
@@ -348,6 +352,7 @@ namespace
 		bool  noCureLogged{ false };
 		int   pendingHits{ 0 };   // hits taken from disease sources that are waiting for their infection roll (not saved)
 		std::chrono::steady_clock::time_point firstPendingHit{};
+		std::chrono::steady_clock::time_point lastWound{};   // time of the last wound that was counted (not reset by a roll)
 	};
 
 	std::recursive_mutex mtx;
@@ -928,7 +933,8 @@ namespace
 			if (r.pendingHits > 0) {
 				if (r.disease >= 0 || a->IsDead()) {
 					r.pendingHits = 0;
-				} else if (!a->IsInCombat() || std::chrono::duration<float>(nowReal - r.firstPendingHit).count() >= cfg.hitRollDelay) {
+				} else if ((!a->IsInCombat() && std::chrono::duration<float>(nowReal - r.lastWound).count() >= cfg.hitQuiet) ||
+					std::chrono::duration<float>(nowReal - r.firstPendingHit).count() >= cfg.hitRollDelay) {
 					const float resist = std::clamp(a->AsActorValueOwner()->GetActorValue(RE::ActorValue::kResistDisease), 0.0f, 100.0f);
 					const float each = std::clamp(cfg.hitDiseaseChance * cfg.diseaseChanceMult * (1.0f - resist / 100.0f), 0.0f, 100.0f) / 100.0f;
 					const float total = 100.0f * (1.0f - std::pow(1.0f - each, static_cast<float>(r.pendingHits)));
@@ -1054,7 +1060,12 @@ namespace
 			if (cfg.hitRollDelay > 0.0f) {
 				// do not roll the instant the monster lands its first blow: collect the hits, Tick() rolls them later
 				auto& rec = it->second;
-				if (rec.pendingHits == 0) rec.firstPendingHit = std::chrono::steady_clock::now();
+				const auto tNow = std::chrono::steady_clock::now();
+				// the game can send dozens of hit events per second for one blow or a ragdoll: count a wound at most every hitMinInterval seconds
+				if (rec.lastWound != std::chrono::steady_clock::time_point{} && std::chrono::duration<float>(tNow - rec.lastWound).count() < cfg.hitMinInterval)
+					return BSEventNotifyControl::kContinue;
+				rec.lastWound = tNow;
+				if (rec.pendingHits == 0) rec.firstPendingHit = tNow;
 				++rec.pendingHits;
 				Dbg("{} was hit by disease source {} (wound #{} waiting for its infection roll)", victim->GetDisplayFullName(), attacker->GetDisplayFullName(),
 					rec.pendingHits);
