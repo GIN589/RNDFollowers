@@ -3,14 +3,8 @@
   "name": "rndfollowers",
   "version-string": "0.1.0",
   "dependencies": [
-    "directxmath",
-    "directxtk",
-    "fmt",
-    "nlohmann-json",
-    "rapidcsv",
-    "simpleini",
+    "commonlibsse-ng",
     "spdlog",
-    "toml11",
-    "xbyak"
+    "simpleini"
   ]
 }
