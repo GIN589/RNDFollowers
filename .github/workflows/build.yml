@@ -1,4 +1,4 @@
-'name: Build RNDFollowers
+name: Build RNDFollowers
 
 on:
   workflow_dispatch:
