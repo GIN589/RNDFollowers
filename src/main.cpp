@@ -566,7 +566,7 @@ namespace
 		if (!audio) return;
 		RE::BSSoundHandle handle;
 		if (!audio->BuildSoundDataFromDescriptor(handle, snd->soundDescriptor)) return;
-		handle.SetPosition(a->GetPositionX(), a->GetPositionY(), a->GetPositionZ());
+		handle.SetPosition(a->GetPosition());
 		if (auto* root = a->Get3D()) handle.SetObjectToFollow(root);
 		handle.Play();
 	}
