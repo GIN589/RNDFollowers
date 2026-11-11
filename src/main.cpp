@@ -74,6 +74,7 @@ namespace
 		bool  uiChinese{ true };
 		// --- auto-eat: followers eat / drink from their own inventory
 		bool  autoEat{ true }, autoDrink{ true }, autoCure{ true };
+		bool  eatSound{ true };   // play the item's own vanilla use sound (chewing / drinking) when a follower uses an item
 		int   autoEatStage{ 3 }, autoDrinkStage{ 2 };
 		bool  autoEatRaw{ false }, autoEatSpoiled{ false }, autoEatRiver{ false };
 		float autoEatCooldown{ 0.25f };   // game hours between meals
@@ -153,6 +154,7 @@ namespace
 		M("AutoCured", cfg.msgCured);
 		cfg.autoCure = B("AutoEat", "CureWhenSick", cfg.autoCure);
 		cfg.autoEat = B("AutoEat", "Enabled", cfg.autoEat);
+		cfg.eatSound = B("AutoEat", "PlaySound", cfg.eatSound);
 		cfg.autoDrink = B("AutoEat", "Drink", cfg.autoDrink);
 		cfg.autoEatStage = std::clamp((int)ini.GetLongValue("AutoEat", "HungerStage", cfg.autoEatStage), 1, 5);
 		cfg.autoDrinkStage = std::clamp((int)ini.GetLongValue("AutoEat", "ThirstStage", cfg.autoDrinkStage), 1, 4);
@@ -554,6 +556,21 @@ namespace
 		}
 	}
 
+	// Plays the item's own use sound (the one the game plays when the player eats / drinks it) at the follower.
+	void PlayUseSound(RE::Actor* a, RE::AlchemyItem* alch)
+	{
+		if (!cfg.eatSound || !a || !alch) return;
+		auto* snd = alch->data.consumptionSound;
+		if (!snd || !snd->soundDescriptor) return;
+		auto* audio = RE::BSAudioManager::GetSingleton();
+		if (!audio) return;
+		RE::BSSoundHandle handle;
+		if (!audio->BuildSoundDataFromDescriptor(handle, snd->soundDescriptor)) return;
+		handle.SetPosition(a->GetPosition());
+		if (auto* root = a->Get3D()) handle.SetObjectToFollow(root);
+		handle.Play();
+	}
+
 	// Takes ONE suitable item out of the follower's inventory and applies it. mode: 0 = food (hunger), 1 = drink (thirst), 2 = cure item.
 	// Preference: an item that does not overshoot the need (the biggest such one), otherwise the smallest one.
 	bool EatOne(RE::Actor* a, Record& r, int mode)
@@ -585,6 +602,7 @@ namespace
 		}
 		if (!best) return false;
 		static_cast<void>(a->RemoveItem(best, 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr));
+		PlayUseSound(a, best);
 		ApplyConsume(a, r, best, best->GetFormID(), mode == 0 ? "auto-ate" : mode == 1 ? "auto-drank" : "auto-cured with");
 		const std::string nm = best->GetName();
 		Say(a, FormatMsg(mode == 0 ? cfg.msgAte : mode == 1 ? cfg.msgDrank : cfg.msgCured, nm));
