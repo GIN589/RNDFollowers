@@ -559,6 +559,12 @@ namespace
 	// Plays the item's own use sound (the one the game plays when the player eats / drinks it) at the follower.
 	void PlayUseSound(RE::Actor* a, RE::AlchemyItem* alch)
 	{
+#ifdef RND_NEW_COMMONLIB
+		// TODO: the 1.7.x library (alandtse CommonLibSSE-NG) has no BSAudioManager::BuildSoundDataFromDescriptor; sound is only built into the legacy (1.5.97) DLL for now
+		static_cast<void>(a);
+		static_cast<void>(alch);
+		return;
+#else
 		if (!cfg.eatSound || !a || !alch) return;
 		auto* snd = alch->data.consumptionSound;
 		if (!snd || !snd->soundDescriptor) return;
@@ -566,9 +572,10 @@ namespace
 		if (!audio) return;
 		RE::BSSoundHandle handle;
 		if (!audio->BuildSoundDataFromDescriptor(handle, snd->soundDescriptor)) return;
-		handle.SetPosition(a->GetPositionX(), a->GetPositionY(), a->GetPositionZ());
+		handle.SetPosition(a->GetPosition());
 		if (auto* root = a->Get3D()) handle.SetObjectToFollow(root);
 		handle.Play();
+#endif
 	}
 
 	// Takes ONE suitable item out of the follower's inventory and applies it. mode: 0 = food (hunger), 1 = drink (thirst), 2 = cure item.
